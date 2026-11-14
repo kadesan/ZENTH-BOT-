@@ -1,0 +1,7 @@
+.env
+node_modules/
+*.log
+data/price-alerts.json
+data/price-alerts.json.tmp
+data/pve-groups.json
+data/pve-groups.json.tmp
