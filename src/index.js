@@ -21,6 +21,10 @@ import {
 } from "discord.js";
 import cron from "node-cron";
 import dotenv from "dotenv";
+import { hostname } from "node:os";
+import path from "node:path";
+import { mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { EVENTS, BOT_CONFIG } from "./events.js";
 import { sendEventNotification } from "./notifier.js";
 import {
@@ -68,6 +72,10 @@ const MENTION_ROLE = process.env.MENTION_ROLE || "";
 const MARKET_CHANNEL_ID = "1571056334038630561";
 const WORLD_BOSS_CHANNEL_ID = "1572255701538181222";
 const WORLD_BOSS_ROLE_ID = "1565924221194993664";
+const SCHEDULER_LEASE_PATH = path.join(process.cwd(), "data", "scheduler-lease.json");
+const SCHEDULER_LEASE_MS = 90_000;
+const SCHEDULER_HEARTBEAT_MS = 30_000;
+const SCHEDULER_OWNER_TOKEN = randomUUID();
 const SIEGE_DM_ROLE_ID = "1556537224340832316";
 const ATTENDANCE_CHANNEL_ID = "1570568835508084871";
 const APPLICATION_PANEL_CHANNEL_ID = "1471153320428306593";
@@ -769,6 +777,142 @@ async function handleGuildApplicationDelete(interaction) {
 // ─── Registro de Crons ────────────────────────────────────────────────────────
 let scheduledJobs = [];
 let worldBossSchedulesRegistered = false;
+let schedulerHeartbeat = null;
+let ownsSchedulerLease = false;
+let schedulerJobsRegistered = false;
+let schedulerRetryTimer = null;
+let schedulerRetryRunning = false;
+
+async function acquireSchedulerLease({ quiet = false } = {}) {
+  await mkdir(path.dirname(SCHEDULER_LEASE_PATH), { recursive: true });
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    try {
+      const now = Date.now();
+      await writeFile(
+        SCHEDULER_LEASE_PATH,
+        JSON.stringify({ token: SCHEDULER_OWNER_TOKEN, pid: process.pid, host: hostname(), heartbeatAt: now }),
+        { encoding: "utf8", flag: "wx" },
+      );
+      ownsSchedulerLease = true;
+      schedulerHeartbeat = setInterval(() => void renewSchedulerLease(), SCHEDULER_HEARTBEAT_MS);
+      schedulerHeartbeat.unref?.();
+      console.log("🔐 Esta instancia obtuvo la llave de avisos automáticos.");
+      return true;
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+    }
+
+    let lock;
+    let lockMtime = 0;
+    try {
+      lock = JSON.parse(await readFile(SCHEDULER_LEASE_PATH, "utf8"));
+      const fileInfo = await stat(SCHEDULER_LEASE_PATH);
+      lockMtime = fileInfo.mtimeMs;
+    } catch {
+      try {
+        const fileInfo = await stat(SCHEDULER_LEASE_PATH);
+        lockMtime = fileInfo.mtimeMs;
+      } catch {
+        continue;
+      }
+    }
+
+    const isLocalOwner = lock?.host === hostname() && Number.isInteger(lock.pid) && lock.pid > 0;
+    let localOwnerIsAlive = false;
+    if (isLocalOwner) {
+      try {
+        process.kill(lock.pid, 0);
+        localOwnerIsAlive = true;
+      } catch (processError) {
+        localOwnerIsAlive = processError.code === "EPERM";
+      }
+    }
+    const remoteLeaseIsFresh = !isLocalOwner && Date.now() - lockMtime < SCHEDULER_LEASE_MS;
+    if (localOwnerIsAlive || remoteLeaseIsFresh) {
+      if (!quiet) console.warn("⚠️ Otra instancia ya administra los avisos automáticos; esta no registrará cron jobs.");
+      return false;
+    }
+
+    const stalePath = `${SCHEDULER_LEASE_PATH}.${SCHEDULER_OWNER_TOKEN}.stale`;
+    try {
+      await rename(SCHEDULER_LEASE_PATH, stalePath);
+      await unlink(stalePath).catch(() => {});
+    } catch {
+      // Otra instancia pudo renovar o reclamar la llave; se vuelve a intentar.
+    }
+  }
+  console.error("❌ No pude obtener la llave de avisos automáticos; los cron jobs quedan desactivados para evitar duplicados.");
+  return false;
+}
+
+async function renewSchedulerLease() {
+  if (!ownsSchedulerLease) return;
+  try {
+    const lock = JSON.parse(await readFile(SCHEDULER_LEASE_PATH, "utf8"));
+    if (lock.token !== SCHEDULER_OWNER_TOKEN) throw new Error("La llave pertenece a otra instancia.");
+    await writeFile(SCHEDULER_LEASE_PATH, JSON.stringify({
+      token: SCHEDULER_OWNER_TOKEN,
+      pid: process.pid,
+      host: hostname(),
+      heartbeatAt: Date.now(),
+    }), "utf8");
+  } catch (error) {
+    ownsSchedulerLease = false;
+    clearInterval(schedulerHeartbeat);
+    for (const job of scheduledJobs) job.stop();
+    scheduledJobs = [];
+    schedulerJobsRegistered = false;
+    console.error(`❌ Se perdió la llave de avisos; detuve los cron jobs para evitar duplicados: ${error.message}`);
+    scheduleSchedulerRetry();
+  }
+}
+
+async function releaseSchedulerLease() {
+  clearInterval(schedulerRetryTimer);
+  schedulerRetryTimer = null;
+  clearInterval(schedulerHeartbeat);
+  schedulerHeartbeat = null;
+  if (!ownsSchedulerLease) return;
+  ownsSchedulerLease = false;
+  try {
+    const lock = JSON.parse(await readFile(SCHEDULER_LEASE_PATH, "utf8"));
+    if (lock.token === SCHEDULER_OWNER_TOKEN) await unlink(SCHEDULER_LEASE_PATH);
+  } catch {
+    // La llave ya fue retirada o reclamada.
+  }
+}
+
+function startScheduledJobs() {
+  if (!ownsSchedulerLease || schedulerJobsRegistered) return;
+  schedulerJobsRegistered = true;
+  registerSchedules();
+  registerWorldBossSchedules();
+  const priceAlertJob = cron.schedule("*/5 * * * *", () => void checkPriceAlerts(), {
+    timezone: BOT_CONFIG.serverTimezone,
+  });
+  scheduledJobs.push(priceAlertJob);
+  void checkPriceAlerts();
+}
+
+function scheduleSchedulerRetry() {
+  if (schedulerRetryTimer) return;
+  schedulerRetryTimer = setInterval(async () => {
+    if (schedulerRetryRunning || ownsSchedulerLease) return;
+    schedulerRetryRunning = true;
+    try {
+      if (await acquireSchedulerLease({ quiet: true })) {
+        clearInterval(schedulerRetryTimer);
+        schedulerRetryTimer = null;
+        startScheduledJobs();
+      }
+    } catch (error) {
+      console.error(`❌ No se pudo volver a tomar la llave de avisos: ${error.message}`);
+    } finally {
+      schedulerRetryRunning = false;
+    }
+  }, 15_000);
+  schedulerRetryTimer.unref?.();
+}
 
 function registerSchedules() {
   console.log("\n📅 Registrando horarios de eventos:\n");
@@ -900,6 +1044,7 @@ let checkingPriceAlerts = false;
 const privateAlertRetryAfter = new Map();
 
 async function checkPriceAlerts() {
+  if (!ownsSchedulerLease) return;
   if (checkingPriceAlerts) return;
   checkingPriceAlerts = true;
   try {
@@ -942,6 +1087,7 @@ let checkingWorldBossTimers = false;
 const sentWorldBossReminderKeys = new Set();
 
 async function checkWorldBossRespawns() {
+  if (!ownsSchedulerLease) return;
   if (checkingWorldBossTimers) return;
   checkingWorldBossTimers = true;
   try {
@@ -2134,9 +2280,10 @@ async function handleSlashCommand(interaction) {
 }
 
 // ─── Evento: Bot Listo ─────────────────────────────────────────────────────────
-client.once("clientReady", (bot) => {
+client.once("clientReady", async (bot) => {
   console.log(`\n${"=".repeat(50)}`);
   console.log(`  🤖 Bot conectado como: ${bot.user.tag}`);
+  console.log(`  🧭 Instancia: ${hostname()} · proceso ${process.pid}`);
   console.log(`  🌐 Servidores: ${bot.guilds.cache.size}`);
   console.log(`  📡 Canal objetivo: ${CHANNEL_ID}`);
   console.log(`  🔔 Mención configurada: ${MENTION_ROLE || "(ninguna)"}`);
@@ -2153,14 +2300,16 @@ client.once("clientReady", (bot) => {
     status: "online",
   });
 
-  // Registrar los crons después de que el bot esté listo
-  registerSchedules();
-  registerWorldBossSchedules();
-  const priceAlertJob = cron.schedule("*/5 * * * *", () => void checkPriceAlerts(), {
-    timezone: BOT_CONFIG.serverTimezone,
-  });
-  scheduledJobs.push(priceAlertJob);
-  void checkPriceAlerts();
+  // Solo una instancia compartida registra las alertas automáticas.
+  try {
+    if (await acquireSchedulerLease()) {
+      startScheduledJobs();
+    } else {
+      scheduleSchedulerRetry();
+    }
+  } catch (error) {
+    console.error(`❌ No se pudo iniciar el programador de alertas: ${error.message}`);
+  }
   pveGroupCleanupTimer = setInterval(() => void checkPveGroupsForCleanup(), 30_000);
   void checkPveGroupsForCleanup();
   void refreshAllPveGroupMessages();
@@ -2354,14 +2503,18 @@ process.on("unhandledRejection", (reason) => {
   console.error("❌ Promesa rechazada sin manejar:", reason);
 });
 
-process.on("SIGINT", () => {
+async function shutdownBot() {
   console.log("\n🛑 Deteniendo bot...");
   for (const job of scheduledJobs) job.stop();
   if (pveGroupCleanupTimer) clearInterval(pveGroupCleanupTimer);
+  await releaseSchedulerLease();
   client.destroy();
   console.log("👋 Bot desconectado. ¡Hasta luego, Daeva!");
   process.exit(0);
-});
+}
+
+process.once("SIGINT", () => void shutdownBot());
+process.once("SIGTERM", () => void shutdownBot());
 
 // ─── Iniciar Bot ───────────────────────────────────────────────────────────────
 console.log("🚀 Iniciando AION 2 Events Bot...\n");
