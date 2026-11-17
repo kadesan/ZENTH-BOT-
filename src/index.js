@@ -76,6 +76,7 @@ const APPLICATION_STAFF_IDS = ["1146577008109834330", "1266083736936513637"];
 const APPLICATION_BUTTON_ID = "guild-application:open";
 const APPLICATION_MODAL_ID = "guild-application:submit";
 const APPLICATION_CLOSE_BUTTON_ID = "guild-application:close";
+const APPLICATION_DELETE_BUTTON_ID = "guild-application:delete";
 const APPLICATION_APPROVE_BUTTON_ID = "guild-application:approve";
 const APPLICATION_REJECT_BUTTON_ID = "guild-application:reject";
 const APPLICATION_REJECT_MODAL_PREFIX = "guild-application:reject-reason:";
@@ -472,28 +473,10 @@ async function handleGuildApplicationSubmit(interaction) {
       if (target.kind === "user") allowedMentions.users.push(target.id);
       else allowedMentions.roles.push(target.id);
     }
-    const closeButton = new ButtonBuilder()
-      .setCustomId(APPLICATION_CLOSE_BUTTON_ID)
-      .setLabel("Cerrar postulación")
-      .setEmoji("🔒")
-      .setStyle(ButtonStyle.Secondary);
-    const approveButton = new ButtonBuilder()
-      .setCustomId(APPLICATION_APPROVE_BUTTON_ID)
-      .setLabel("Aprobar")
-      .setEmoji("✅")
-      .setStyle(ButtonStyle.Success);
-    const rejectButton = new ButtonBuilder()
-      .setCustomId(APPLICATION_REJECT_BUTTON_ID)
-      .setLabel("Rechazar")
-      .setEmoji("❌")
-      .setStyle(ButtonStyle.Danger);
     await ticketChannel.send({
       content: `<@${interaction.user.id}> ${staffTargets.map((target) => target.mention).join(" ")}`,
       embeds: [profileEmbed],
-      components: [
-        new ActionRowBuilder().addComponents(approveButton, rejectButton),
-        new ActionRowBuilder().addComponents(closeButton),
-      ],
+      components: buildApplicationControls("pending"),
       allowedMentions,
     });
     let nicknameNote = "";
@@ -522,10 +505,38 @@ function buildApplicationCloseRow() {
   return new ActionRowBuilder().addComponents(closeButton);
 }
 
+function buildApplicationControls(status) {
+  if (status === "closed") {
+    const deleteButton = new ButtonBuilder()
+      .setCustomId(APPLICATION_DELETE_BUTTON_ID)
+      .setLabel("Borrar")
+      .setEmoji("🗑️")
+      .setStyle(ButtonStyle.Danger);
+    return [new ActionRowBuilder().addComponents(deleteButton)];
+  }
+  if (status === "approved" || status === "rejected") {
+    return [buildApplicationCloseRow()];
+  }
+  const approveButton = new ButtonBuilder()
+    .setCustomId(APPLICATION_APPROVE_BUTTON_ID)
+    .setLabel("Aprobar")
+    .setEmoji("✅")
+    .setStyle(ButtonStyle.Success);
+  const rejectButton = new ButtonBuilder()
+    .setCustomId(APPLICATION_REJECT_BUTTON_ID)
+    .setLabel("Rechazar")
+    .setEmoji("❌")
+    .setStyle(ButtonStyle.Danger);
+  return [
+    new ActionRowBuilder().addComponents(approveButton, rejectButton),
+    buildApplicationCloseRow(),
+  ];
+}
+
 function getGuildApplicationContext(channel) {
-  const applicantId = channel?.topic?.match(/(?:^|;)applicant:(\d{17,20})(?:;|$)/)?.[1];
+  const applicantId = channel?.topic?.match(/applicant:(\d{17,20})/)?.[1];
   const encodedCharacter = channel?.topic?.match(/(?:^|;)character:([^;]+)(?:;|$)/)?.[1];
-  const status = channel?.topic?.match(/(?:^|;)status:(pending|approved|rejected)(?:;|$)/)?.[1] || "pending";
+  const status = channel?.topic?.match(/(?:^|;)status:(pending|approved|rejected|closed)(?:;|$)/)?.[1] || "pending";
   if (!applicantId) return null;
   let characterName = channel.name.replace(/^postulacion-/, "");
   if (encodedCharacter) {
@@ -534,12 +545,15 @@ function getGuildApplicationContext(channel) {
     } catch {
       // Si el tema guardado no se puede decodificar, se usa el nombre del canal.
     }
+  } else {
+    const legacyCharacter = channel.topic?.match(/Postulación de (.+?)\s*[·|]\s*applicant:/i)?.[1];
+    if (legacyCharacter) characterName = legacyCharacter.trim();
   }
   return { applicantId, characterName, status };
 }
 
 async function updateGuildApplicationCard(channel, status, color, decision) {
-  const topic = (channel.topic || "").replace(/;status:(?:pending|approved|rejected)/g, "");
+  const topic = (channel.topic || "").replace(/;status:(?:pending|approved|rejected|closed)/g, "");
   await channel.setTopic(`${topic};status:${decision}`.slice(0, 1024));
   const messages = await channel.messages.fetch({ limit: 50 });
   const card = messages.find((message) =>
@@ -548,8 +562,43 @@ async function updateGuildApplicationCard(channel, status, color, decision) {
   if (!card) return;
   const embed = EmbedBuilder.from(card.embeds[0])
     .setColor(color)
-    .addFields({ name: "📌 Estado", value: status, inline: false });
-  await card.edit({ embeds: [embed], components: [buildApplicationCloseRow()] });
+    .setFields(
+      ...card.embeds[0].fields.filter((field) => field.name !== "📌 Estado"),
+      { name: "📌 Estado", value: status, inline: false },
+    );
+  await card.edit({ embeds: [embed], components: buildApplicationControls(decision) });
+}
+
+async function refreshGuildApplicationTickets(guild) {
+  try {
+    const allChannels = await guild.channels.fetch();
+    const category = allChannels.find((channel) =>
+      channel?.type === ChannelType.GuildCategory && channel.name === APPLICATION_CATEGORY_NAME);
+    if (!category) return;
+
+    for (const channel of allChannels.values()) {
+      if (channel?.type !== ChannelType.GuildText || channel.parentId !== category.id) continue;
+      const application = getGuildApplicationContext(channel);
+      if (!application) continue;
+      if (!channel.topic?.includes(";character:")) {
+        const topic = `applicant:${application.applicantId};character:${encodeURIComponent(application.characterName)};status:${application.status}`;
+        await channel.setTopic(topic.slice(0, 1024));
+      }
+      if (application.status === "closed") {
+        await channel.permissionOverwrites.delete(application.applicantId).catch(() => {});
+      }
+
+      const messages = await channel.messages.fetch({ limit: 50 });
+      const card = messages.find((message) =>
+        message.author.id === client.user.id &&
+        message.embeds.some((embed) => embed.title === "📨 Nueva postulación a ZENTH"));
+      if (card) {
+        await card.edit({ components: buildApplicationControls(application.status) });
+      }
+    }
+  } catch (error) {
+    console.error(`❌ No se pudieron actualizar los controles de los tickets abiertos: ${error.message}`);
+  }
 }
 
 async function canDecideGuildApplication(interaction) {
@@ -654,14 +703,14 @@ async function handleGuildApplicationRejectionSubmit(interaction) {
 
 async function handleGuildApplicationClose(interaction) {
   const ticketChannel = interaction.channel;
-  const applicantId = ticketChannel?.topic?.match(/applicant:(\d{17,20})/)?.[1];
-  if (!interaction.guild || !ticketChannel || ticketChannel.type !== ChannelType.GuildText || !applicantId) {
+  const application = getGuildApplicationContext(ticketChannel);
+  if (!interaction.guild || !ticketChannel || ticketChannel.type !== ChannelType.GuildText || !application) {
     await interaction.reply({ content: "Este botón no pertenece a un ticket de postulación.", ephemeral: true });
     return;
   }
 
   const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
-  const isApplicant = interaction.user.id === applicantId;
+  const isApplicant = interaction.user.id === application.applicantId;
   const isStaff = APPLICATION_STAFF_IDS.some((id) =>
     id === interaction.user.id || member?.roles.cache.has(id));
   const isAdmin = interaction.memberPermissions?.has(PermissionFlagsBits.Administrator);
@@ -670,8 +719,37 @@ async function handleGuildApplicationClose(interaction) {
     return;
   }
 
-  await interaction.reply({ content: "🔒 Postulación cerrada. El canal se eliminará.", ephemeral: true });
-  await ticketChannel.delete(`Postulación cerrada por ${interaction.user.tag}`);
+  if (application.status === "closed") {
+    await interaction.reply({ content: "Esta postulación ya está cerrada. El equipo puede borrarla con el botón correspondiente.", ephemeral: true });
+    return;
+  }
+
+  await interaction.deferReply({ ephemeral: true });
+  await ticketChannel.permissionOverwrites.delete(
+    application.applicantId,
+    `Acceso retirado al cerrar la postulación por ${interaction.user.tag}`,
+  );
+  await updateGuildApplicationCard(ticketChannel, "🔒 Cerrada", 0x7f8c8d, "closed");
+  await interaction.editReply("🔒 Postulación cerrada. Se quitó el acceso del postulante; el canal queda disponible para el equipo hasta que pulsen **Borrar**.");
+}
+
+async function handleGuildApplicationDelete(interaction) {
+  if (!(await canDecideGuildApplication(interaction))) {
+    await interaction.reply({ content: "Solo los administradores o el equipo de reclutamiento pueden borrar tickets.", ephemeral: true });
+    return;
+  }
+  const channel = interaction.channel;
+  const application = getGuildApplicationContext(channel);
+  if (!channel || channel.type !== ChannelType.GuildText || !application) {
+    await interaction.reply({ content: "Este botón no pertenece a un ticket de postulación válido.", ephemeral: true });
+    return;
+  }
+  if (application.status !== "closed") {
+    await interaction.reply({ content: "Primero cierra la postulación. El botón Borrar solo está disponible después del cierre.", ephemeral: true });
+    return;
+  }
+  await interaction.reply({ content: "🗑️ Ticket borrado.", ephemeral: true });
+  await channel.delete(`Ticket de postulación borrado por ${interaction.user.tag}`);
 }
 
 // ─── Registro de Crons ────────────────────────────────────────────────────────
@@ -2067,6 +2145,7 @@ client.once("clientReady", (bot) => {
   for (const guild of bot.guilds.cache.values()) {
     void registerGuildCommands(guild);
     void ensureGuildApplicationPanel(guild);
+    void refreshGuildApplicationTickets(guild);
   }
 
   console.log("✅ Bot iniciado correctamente. Esperando eventos...\n");
@@ -2076,6 +2155,7 @@ client.once("clientReady", (bot) => {
 client.on("guildCreate", (guild) => {
   void registerGuildCommands(guild);
   void ensureGuildApplicationPanel(guild);
+  void refreshGuildApplicationTickets(guild);
 });
 
 // ─── Evento: Mensajes ──────────────────────────────────────────────────────────
@@ -2151,6 +2231,16 @@ client.on("interactionCreate", (interaction) => {
     handleGuildApplicationRejectionSubmit(interaction).catch(async (error) => {
       console.error("❌ No se pudo registrar el rechazo:", error.message);
       const response = { content: "No se pudo registrar el rechazo. Inténtalo de nuevo.", ephemeral: true };
+      if (interaction.deferred || interaction.replied) await interaction.followUp(response).catch(() => {});
+      else await interaction.reply(response).catch(() => {});
+    });
+    return;
+  }
+
+  if (interaction.isButton() && interaction.customId === APPLICATION_DELETE_BUTTON_ID) {
+    handleGuildApplicationDelete(interaction).catch(async (error) => {
+      console.error("❌ No se pudo borrar el ticket de postulación:", error.message);
+      const response = { content: "No se pudo borrar el ticket. Inténtalo de nuevo.", ephemeral: true };
       if (interaction.deferred || interaction.replied) await interaction.followUp(response).catch(() => {});
       else await interaction.reply(response).catch(() => {});
     });
