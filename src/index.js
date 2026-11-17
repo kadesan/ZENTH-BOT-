@@ -55,6 +55,8 @@ const TOKEN = process.env.DISCORD_TOKEN;
 const CHANNEL_ID = process.env.DISCORD_CHANNEL_ID;
 const MENTION_ROLE = process.env.MENTION_ROLE || "";
 const MARKET_CHANNEL_ID = "1571056334038630561";
+const WORLD_BOSS_CHANNEL_ID = "1572255701538181222";
+const WORLD_BOSS_ROLE_ID = "1565924221194993664";
 const PVE_CATEGORY_ID = "1135023136904052797";
 const PVE_VOICE_ROLE_IDS = ["1556537224340832316", "1549946232200232971"];
 const PRICE_COMMANDS = new Set(["precio", "alerta-precio", "mis-alertas", "quitar-alerta"]);
@@ -102,7 +104,7 @@ const SLASH_COMMANDS = [
       .setRequired(true)),
   new SlashCommandBuilder()
     .setName("alerta-precio")
-    .setDescription("Recibe una mención personal si un objeto baja a tu precio")
+    .setDescription("Recibe un mensaje privado si un objeto baja a tu precio")
     .setDefaultMemberPermissions(null)
     .addStringOption((option) => option
       .setName("articulo")
@@ -202,6 +204,16 @@ const SLASH_COMMANDS = [
         { name: "SIEGE", value: "siege" },
         { name: "Guardian Lord Nahma", value: "nahma" },
       )),
+  new SlashCommandBuilder()
+    .setName("diagnostico-mercado")
+    .setDescription("Comprueba la conexión de ACLClouds con aion2.exchange")
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addStringOption((option) => option
+      .setName("termino")
+      .setDescription("Texto que quieres probar, por ejemplo sword")
+      .setMinLength(2)
+      .setMaxLength(80)
+      .setRequired(false)),
 ];
 
 async function registerGuildCommands(guild) {
@@ -255,8 +267,49 @@ function registerSchedules() {
   console.log(`\n📊 Total de trabajos programados: ${scheduledJobs.length}\n`);
 }
 
+function registerWorldBossSchedules() {
+  const worldBosses = [
+    {
+      name: "Watcher Kaira",
+      // Spawn cada 3 horas desde las 01:00 ET; avisar 10 minutos antes.
+      cron: "0 50 0,3,6,9,12,15,18,21 * * *",
+    },
+    {
+      name: "Argo, the Spirit King",
+      // Spawn diario a las 10:30 y 22:30 ET; avisar 10 minutos antes.
+      cron: "0 20 10,22 * * *",
+    },
+  ];
+
+  for (const boss of worldBosses) {
+    const job = cron.schedule(boss.cron, async () => {
+      const spawnTimestamp = Math.floor(Date.now() / 1000) + 10 * 60;
+      try {
+        const channel = await client.channels.fetch(WORLD_BOSS_CHANNEL_ID);
+        if (!channel?.isTextBased()) {
+          console.error(`❌ No se encontró el canal de World Boss ${WORLD_BOSS_CHANNEL_ID}.`);
+          return;
+        }
+        await channel.send({
+          content:
+            `<@&${WORLD_BOSS_ROLE_ID}> 🔔 **${boss.name} aparece en 10 minutos.**\n` +
+            `Hora de aparición: <t:${spawnTimestamp}:t> ET · NA East / Zikel.`,
+          allowedMentions: { parse: [], roles: [WORLD_BOSS_ROLE_ID] },
+        });
+        console.log(`🔔 Aviso enviado para ${boss.name}; solo se mencionó el rol configurado.`);
+      } catch (error) {
+        console.error(`❌ No se pudo enviar el aviso de ${boss.name}: ${error.message}`);
+      }
+    }, { timezone: BOT_CONFIG.serverTimezone });
+
+    scheduledJobs.push(job);
+    console.log(`  ✅ [World Boss] ${boss.name} → ${boss.cron} (${BOT_CONFIG.serverTimezone})`);
+  }
+}
+
 // ─── Comando !eventos ─────────────────────────────────────────────────────────
 let checkingPriceAlerts = false;
+const privateAlertRetryAfter = new Map();
 
 async function checkPriceAlerts() {
   if (checkingPriceAlerts) return;
@@ -264,22 +317,27 @@ async function checkPriceAlerts() {
   try {
     const alerts = await getActivePriceAlerts();
     for (const alert of alerts) {
+      if ((privateAlertRetryAfter.get(alert.id) || 0) > Date.now()) continue;
       try {
         const item = await getMarketItem(alert.itemKey);
         const currentPrice = Number(item.price);
         if (item.on_market !== true || !Number.isFinite(currentPrice) || currentPrice > alert.maxPrice) continue;
 
-        const channel = await client.channels.fetch(alert.channelId);
-        if (!channel?.isTextBased()) continue;
-        await channel.send({
-          content:
-            `<@${alert.userId}> 🔔 **¡Se activó tu alerta de precio!**\n` +
+        const user = await client.users.fetch(alert.userId);
+        try {
+          await user.send(
+            `🔔 **¡Se activó tu alerta de precio!**\n` +
             `**${item.name || alert.itemName}** está publicado a **${new Intl.NumberFormat("es-CO").format(currentPrice)} kinah** ` +
             `(tu máximo: ${new Intl.NumberFormat("es-CO").format(alert.maxPrice)} kinah) en NA East · Zikel.`,
-          allowedMentions: { parse: [], users: [alert.userId] },
-        });
+          );
+        } catch (error) {
+          privateAlertRetryAfter.set(alert.id, Date.now() + 15 * 60 * 1000);
+          console.warn(`⚠️ No se pudo enviar por DM la alerta ${alert.id}; revisaré de nuevo en 15 minutos: ${error.message}`);
+          continue;
+        }
         await removeTriggeredPriceAlert(alert.id);
-        console.log(`🔔 Alerta ${alert.id} enviada a un miembro; alerta de un solo uso eliminada.`);
+        privateAlertRetryAfter.delete(alert.id);
+        console.log(`🔔 Alerta ${alert.id} enviada por mensaje directo; alerta de un solo uso eliminada.`);
       } catch (error) {
         console.error(`❌ No se pudo revisar la alerta ${alert.id}: ${error.message}`);
       }
@@ -443,7 +501,7 @@ function buildHelpEmbed() {
           "`/eventos` → Muestra el calendario de eventos de la semana\n" +
           "`/mejoras personaje` → Consulta prioridades de mejora para Zikel\n" +
           "`/precio articulo` → Consulta precios publicados en el mercado de Zikel\n" +
-          "`/alerta-precio articulo maximo` → Recibe una mención personal al alcanzar ese precio\n" +
+          "`/alerta-precio articulo maximo` → Recibe un aviso privado al alcanzar ese precio\n" +
           "`/mis-alertas` y `/quitar-alerta id` → Administra tus alertas (máximo 5)\n" +
           `Comandos del mercado: solo en <#${MARKET_CHANNEL_ID}>.\n` +
           "`/buscar-grupo` → Crea un grupo PvE por Tank/DPS/Cleric/Chanter y valida personaje/CP en Kisk\n" +
@@ -457,7 +515,10 @@ function buildHelpEmbed() {
         value:
           "El bot avisa **1 hora antes** de cada evento:\n" +
           "⚔️ SIEGE → Jueves & Sábados a las **20:00 ET**\n" +
-          "👑 Nahma → Viernes & Domingos a las **20:00 ET**",
+          "👑 Nahma → Viernes & Domingos a las **20:00 ET**\n\n" +
+          "Avisos de World Boss **10 minutos antes**:\n" +
+          "👁️ Watcher Kaira → Cada 3 horas desde la 01:00 ET\n" +
+          "👑 Argo, the Spirit King → Diario a las 10:30 y 22:30 ET",
         inline: false,
       }
     )
@@ -1154,6 +1215,42 @@ async function createPveGroupFromCommand(interaction) {
 async function handleSlashCommand(interaction) {
   if (!interaction.isChatInputCommand()) return;
 
+  if (interaction.commandName === "diagnostico-mercado") {
+    await interaction.deferReply({ ephemeral: true });
+    const startedAt = Date.now();
+    const url = new URL("https://aion2.exchange/api/items");
+    url.searchParams.set("q", interaction.options.getString("termino") || "sword");
+    url.searchParams.set("server", "12102");
+    url.searchParams.set("limit", "25");
+    try {
+      const response = await fetch(url, {
+        signal: AbortSignal.timeout(12_000),
+        headers: {
+          Accept: "application/json",
+          "User-Agent": "ZENTH-AION2-Discord-Bot/1.0",
+        },
+      });
+      const elapsedMs = Date.now() - startedAt;
+      const body = await response.text();
+      let detail = "";
+      try {
+        const data = JSON.parse(body);
+        detail = ` · ${Array.isArray(data.items) ? data.items.length : 0} objetos recibidos`;
+      } catch {
+        detail = ` · respuesta: ${body.slice(0, 100).replace(/\s+/g, " ") || "vacía"}`;
+      }
+      await interaction.editReply(
+        `Prueba desde ACLClouds: **HTTP ${response.status}** · **${elapsedMs} ms**${detail}`,
+      );
+    } catch (error) {
+      const elapsedMs = Date.now() - startedAt;
+      await interaction.editReply(
+        `Prueba desde ACLClouds: **sin respuesta** · **${elapsedMs} ms** · ${error.name}: ${error.message}`,
+      );
+    }
+    return;
+  }
+
   if (interaction.commandName === "buscar-grupo") {
     await createPveGroupFromCommand(interaction);
     return;
@@ -1181,7 +1278,7 @@ async function handleSlashCommand(interaction) {
     const itemKey = interaction.options.getString("articulo", true);
     await interaction.deferReply();
     try {
-      const item = await getMarketItem(itemKey);
+      const item = await getMarketItem(itemKey, { allowSearchFallback: true });
       const price = Number(item.price);
       const listingCount = Number(item.listings);
       const capturedAt = Date.parse(item.captured_at);
@@ -1193,7 +1290,9 @@ async function handleSlashCommand(interaction) {
           `**Anuncios activos:** ${Number.isFinite(listingCount) ? new Intl.NumberFormat("es-CO").format(listingCount) : "Sin datos"}\n` +
           `**Servidor:** NA East · Zikel`
         )
-        .setFooter({ text: "Datos de mercado de aion2.exchange · precios de anuncios, no ventas confirmadas" })
+        .setFooter({
+          text: `Datos de mercado de ${item._source || "aion2.exchange"} · precio de anuncios, no ventas confirmadas${item._stale || item._fromSearchCache ? " · dato en caché" : ""}`,
+        })
         .setTimestamp();
       if (Number.isFinite(capturedAt)) {
         embed.addFields({ name: "Última captura del mercado", value: `<t:${Math.floor(capturedAt / 1000)}:R>`, inline: false });
@@ -1216,7 +1315,7 @@ async function handleSlashCommand(interaction) {
     const maxPrice = interaction.options.getInteger("maximo", true);
     await interaction.deferReply({ ephemeral: true });
     try {
-      const item = await getMarketItem(itemKey);
+      const item = await getMarketItem(itemKey, { allowSearchFallback: true });
       const alert = await createPriceAlert({
         guildId: interaction.guildId,
         channelId: interaction.channelId,
@@ -1228,7 +1327,7 @@ async function handleSlashCommand(interaction) {
       await checkPriceAlerts();
       await interaction.editReply(
         `✅ Alerta **${alert.id}** creada para **${item.name || `objeto ${itemKey}`}** a **${new Intl.NumberFormat("es-CO").format(maxPrice)} kinah o menos**. ` +
-        `Revisaré el mercado cada 5 minutos y, cuando se cumpla, te mencionaré solo a ti en este canal. La alerta se elimina después del aviso.`
+        `Revisaré el mercado cada 5 minutos y, cuando se cumpla, te enviaré un mensaje directo privado. Asegúrate de permitir mensajes directos del servidor; la alerta se elimina después del aviso.`
       );
     } catch (error) {
       const detail = error instanceof Error ? error.message : "No se pudo crear la alerta.";
@@ -1308,7 +1407,7 @@ async function handleSlashCommand(interaction) {
 }
 
 // ─── Evento: Bot Listo ─────────────────────────────────────────────────────────
-client.once("ready", (bot) => {
+client.once("clientReady", (bot) => {
   console.log(`\n${"=".repeat(50)}`);
   console.log(`  🤖 Bot conectado como: ${bot.user.tag}`);
   console.log(`  🌐 Servidores: ${bot.guilds.cache.size}`);
@@ -1329,6 +1428,7 @@ client.once("ready", (bot) => {
 
   // Registrar los crons después de que el bot esté listo
   registerSchedules();
+  registerWorldBossSchedules();
   const priceAlertJob = cron.schedule("*/5 * * * *", () => void checkPriceAlerts(), {
     timezone: BOT_CONFIG.serverTimezone,
   });
@@ -1356,6 +1456,46 @@ client.on("messageCreate", (msg) => {
   });
   handleTestCommand(msg);
 });
+
+let lastMarketAutocompleteErrorAt = 0;
+
+function marketAutocompleteChoices(items) {
+  return items
+    .filter((item) => item?.item_key != null && item?.name)
+    .slice(0, 25)
+    .map((item) => {
+      const price = Number(item.price);
+      const listings = Number(item.listings);
+      const priceLabel = Number.isFinite(price) ? `${new Intl.NumberFormat("es-CO").format(price)} kinah` : "consulta precio";
+      const listingLabel = Number.isFinite(listings) ? `${new Intl.NumberFormat("es-CO").format(listings)} anuncios` : "Zikel · NA East";
+      return {
+        name: `${item.name} — ${priceLabel} · ${listingLabel}`.slice(0, 100),
+        value: String(item.item_key),
+      };
+    });
+}
+
+async function respondMarketAutocomplete(interaction) {
+  let choices = [];
+  try {
+    const focused = interaction.options.getFocused(true);
+    const items = await searchMarketItems(focused.value);
+    choices = marketAutocompleteChoices(items);
+  } catch (error) {
+    if (Date.now() - lastMarketAutocompleteErrorAt >= 30_000) {
+      lastMarketAutocompleteErrorAt = Date.now();
+      console.error("❌ El autocompletado del mercado no pudo actualizarse:", error.message);
+    }
+  }
+
+  try {
+    await interaction.respond(choices);
+  } catch (error) {
+    if (error.code !== 10062) {
+      console.error("❌ No se pudo responder el autocompletado del mercado:", error.message);
+    }
+  }
+}
 
 client.on("interactionCreate", (interaction) => {
   if (interaction.isModalSubmit() && interaction.customId.startsWith("pve:join:")) {
@@ -1394,25 +1534,7 @@ client.on("interactionCreate", (interaction) => {
       interaction.respond([]).catch(() => {});
       return;
     }
-    const focused = interaction.options.getFocused(true);
-    void searchMarketItems(focused.value)
-      .then((items) => interaction.respond(items
-        .filter((item) => item?.item_key != null && item?.name)
-        .slice(0, 25)
-        .map((item) => {
-          const price = Number(item.price);
-          const listings = Number(item.listings);
-          const priceLabel = Number.isFinite(price) ? `${new Intl.NumberFormat("es-CO").format(price)} kinah` : "sin precio";
-          const listingLabel = Number.isFinite(listings) ? `${new Intl.NumberFormat("es-CO").format(listings)} anuncios` : "sin anuncios";
-          return {
-            name: `${item.name} — ${priceLabel} · ${listingLabel}`.slice(0, 100),
-            value: String(item.item_key),
-          };
-        })))
-      .catch((error) => {
-        console.error("❌ Error al buscar objetos del mercado:", error.message);
-        interaction.respond([]).catch(() => {});
-      });
+    void respondMarketAutocomplete(interaction);
     return;
   }
 
