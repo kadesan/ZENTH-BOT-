@@ -62,6 +62,8 @@ const MENTION_ROLE = process.env.MENTION_ROLE || "";
 const MARKET_CHANNEL_ID = "1571056334038630561";
 const WORLD_BOSS_CHANNEL_ID = "1572255701538181222";
 const WORLD_BOSS_ROLE_ID = "1565924221194993664";
+const SIEGE_DM_ROLE_ID = "1556537224340832316";
+const ATTENDANCE_CHANNEL_ID = "1570568835508084871";
 const PVE_CATEGORY_ID = "1135023136904052797";
 const PVE_VOICE_ROLE_IDS = ["1556537224340832316", "1549946232200232971"];
 const PRICE_COMMANDS = new Set(["precio", "alerta-precio", "mis-alertas", "quitar-alerta"]);
@@ -76,6 +78,7 @@ const GROUP_ROLES = [
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.GuildVoiceStates,
     GatewayIntentBits.MessageContent,   // ← necesario para leer message.content en v14
@@ -88,9 +91,13 @@ const SLASH_COMMANDS = [
     .setDescription("Consulta los eventos de esta semana")
     .setDefaultMemberPermissions(null),
   new SlashCommandBuilder()
+    .setName("asistencia")
+    .setDescription("Registra quién está conectado a tu canal de voz")
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+  new SlashCommandBuilder()
     .setName("temporizador-jefe")
     .setDescription("Programa un aviso usando el tiempo restante que muestra el juego")
-    .setDefaultMemberPermissions(null)
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
     .addStringOption((option) => option
       .setName("jefe")
       .setDescription("World Boss de NA East / Zikel")
@@ -278,6 +285,9 @@ function registerSchedules() {
               return;
             }
             await sendEventNotification(channel, event, schedule.label, MENTION_ROLE);
+            if (event.id === "siege_zikel") {
+              await sendSiegeRoleDirectMessages(channel.guild, schedule.label);
+            }
           } catch (err) {
             console.error(`❌ Error al obtener el canal: ${err.message}`);
           }
@@ -296,6 +306,42 @@ function registerSchedules() {
   }
 
   console.log(`\n📊 Total de trabajos programados: ${scheduledJobs.length}\n`);
+}
+
+async function sendSiegeRoleDirectMessages(guild, dayLabel) {
+  try {
+    const members = await guild.members.fetch();
+    const recipients = members.filter((member) =>
+      !member.user.bot && member.roles.cache.has(SIEGE_DM_ROLE_ID));
+    if (recipients.size === 0) {
+      console.log(`ℹ️ No hay miembros humanos con el rol de aviso SIEGE ${SIEGE_DM_ROLE_ID}.`);
+      return;
+    }
+
+    const siegeTimestamp = Math.floor(Date.now() / 1000) + 60 * 60;
+    let sent = 0;
+    let failed = 0;
+    for (const member of recipients.values()) {
+      const message =
+        `Hola, **${member.displayName}** 👋\n\n` +
+        `⏰ Falta **1 hora** para el **SIEGE de AION 2 · NA East / Zikel** (${dayLabel}).\n` +
+        `El evento comienza <t:${siegeTimestamp}:R> · <t:${siegeTimestamp}:t> ET.\n\n` +
+        `🔊 Entra a la [Call principal](https://discord.com/channels/1135023134945320960/1356438589294252072) ` +
+        `para organizar las parties. Cuando te asignen, ingresa a tu canal de voz correspondiente.\n\n` +
+        `Este es un recordatorio personal para los miembros del rol de Siege.`;
+      try {
+        await member.send({ content: message, allowedMentions: { parse: [] } });
+        sent += 1;
+      } catch (error) {
+        failed += 1;
+        console.warn(`⚠️ No se pudo enviar el DM de SIEGE a ${member.user.tag}: ${error.message}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    console.log(`📩 DMs personalizados de SIEGE: ${sent} enviados, ${failed} no entregados (rol ${SIEGE_DM_ROLE_ID}).`);
+  } catch (error) {
+    console.error(`❌ No se pudieron obtener los miembros del rol para el DM de SIEGE: ${error.message}`);
+  }
 }
 
 function registerWorldBossSchedules() {
@@ -568,6 +614,7 @@ function buildHelpEmbed() {
         name: "📋 Generales",
         value:
           "`/eventos` → Muestra el calendario de eventos de la semana\n" +
+          "`/asistencia` → Envía al canal de registro la fecha y la lista de personas en tu voz\n" +
           "`/temporizador-jefe` → Programa el aviso de Gartua, Lagta, Kashapa o Dartan con el tiempo del juego\n" +
           "`/mejoras personaje` → Consulta prioridades de mejora para Zikel\n" +
           "`/precio articulo` → Consulta precios publicados en el mercado de Zikel\n" +
@@ -589,6 +636,7 @@ function buildHelpEmbed() {
           "Avisos automáticos de World Boss **10 minutos antes**:\n" +
           "👁️ Watcher Kaira → Cada 3 horas desde la 01:00 ET\n" +
           "👑 Argo, the Spirit King → Diario a las 10:30 y 22:30 ET\n" +
+          "⚔️ SIEGE → También envía un DM personal a los miembros con el rol de SIEGE.\n" +
           "Para Gartua, Lagta, Kashapa o Dartan, copia en `/temporizador-jefe` el tiempo restante que muestra el juego.",
         inline: false,
       }
@@ -1324,6 +1372,64 @@ async function handleSlashCommand(interaction) {
 
   if (interaction.commandName === "buscar-grupo") {
     await createPveGroupFromCommand(interaction);
+    return;
+  }
+
+  if (interaction.commandName === "asistencia") {
+    if (!interaction.guild) {
+      await interaction.reply({ content: "Este comando solo funciona dentro del servidor.", ephemeral: true });
+      return;
+    }
+    await interaction.deferReply({ ephemeral: true });
+    try {
+      const requestingMember = await interaction.guild.members.fetch(interaction.user.id);
+      const voiceChannel = requestingMember.voice.channel;
+      if (!voiceChannel) {
+        await interaction.editReply("Conéctate a un canal de voz y vuelve a usar `/asistencia`.");
+        return;
+      }
+
+      const attendanceChannel = await client.channels.fetch(ATTENDANCE_CHANNEL_ID);
+      if (!attendanceChannel?.isTextBased() || attendanceChannel.guildId !== interaction.guildId) {
+        await interaction.editReply(`No pude encontrar el canal de registro <#${ATTENDANCE_CHANNEL_ID}> en este servidor.`);
+        return;
+      }
+
+      const attendees = [...voiceChannel.members.values()]
+        .filter((member) => !member.user.bot)
+        .sort((first, second) => first.displayName.localeCompare(second.displayName, "es"));
+      const now = new Date();
+      const localDate = new Intl.DateTimeFormat("es-CO", {
+        dateStyle: "full",
+        timeStyle: "short",
+        timeZone: BOT_CONFIG.serverTimezone,
+      }).format(now);
+      const participantFields = [];
+      for (let start = 0; start < attendees.length; start += 25) {
+        const batch = attendees.slice(start, start + 25);
+        participantFields.push({
+          name: start === 0 ? `Participantes (${attendees.length})` : `Participantes (continuación ${start / 25 + 1})`,
+          value: batch.map((member, index) => `${start + index + 1}. ${member.displayName}`).join("\n"),
+          inline: false,
+        });
+      }
+      if (participantFields.length === 0) {
+        participantFields.push({ name: "Participantes", value: "No hay miembros en la voz.", inline: false });
+      }
+
+      const attendanceEmbed = new EmbedBuilder()
+        .setColor(0xff0000)
+        .setTitle(`📋 Asistencia — ${voiceChannel.name}`.slice(0, 256))
+        .setDescription(`**Fecha y hora:** ${localDate} ET\n**Canal de voz:** <#${voiceChannel.id}>\n**Registrada por:** ${interaction.user.username}`)
+        .addFields(participantFields)
+        .setFooter({ text: "ZENTH AION 2 BOT • Registro de asistencia" })
+        .setTimestamp(now);
+      await attendanceChannel.send({ embeds: [attendanceEmbed], allowedMentions: { parse: [] } });
+      await interaction.editReply(`Asistencia de **${attendees.length}** persona(s) enviada a <#${ATTENDANCE_CHANNEL_ID}>.`);
+    } catch (error) {
+      console.error(`❌ No se pudo registrar la asistencia de voz: ${error.message}`);
+      await interaction.editReply("No pude registrar la asistencia. Revisa que el bot pueda ver la voz y enviar mensajes en el canal de registro.");
+    }
     return;
   }
 
