@@ -1404,36 +1404,31 @@ async function handleSlashCommand(interaction) {
         timeStyle: "short",
         timeZone: BOT_CONFIG.serverTimezone,
       }).format(now);
-      const participantFields = attendees.length <= 21
-        ? attendees.map((member, index) => ({
-          name: `#${String(index + 1).padStart(2, "0")}`,
-          value: member.displayName,
-          inline: true,
-        }))
+      const participantFields = attendees.length === 0
+        ? [{ name: "👥 Asistentes (0)", value: "No hay miembros conectados.", inline: false }]
         : Array.from({ length: Math.ceil(attendees.length / 14) }, (_, batchIndex) => {
           const start = batchIndex * 14;
           const batch = attendees.slice(start, start + 14);
+          const rangeEnd = start + batch.length;
           return {
-            name: batchIndex === 0 ? `👥 Participantes (${attendees.length})` : `Continuación ${batchIndex + 1}`,
-            value: batch.map((member, index) => `${String(start + index + 1).padStart(2, "0")} · ${member.displayName}`).join("\n"),
+            name: batchIndex === 0
+              ? `👥 Asistentes · ${attendees.length}`
+              : `Asistentes · ${start + 1}–${rangeEnd}`,
+            value: batch.map((member, index) => `**${String(start + index + 1).padStart(2, "0")}** · ${member.displayName}`).join("\n"),
             inline: false,
           };
         });
 
       const attendanceEmbed = new EmbedBuilder()
         .setColor(0xff0000)
-        .setTitle("📋 Registro de asistencia")
-        .setDescription(`Listado de personas conectadas al momento del registro en <#${voiceChannel.id}>.`)
-        .addFields(
-          { name: "📅 Fecha y hora", value: `${localDate} ET`, inline: true },
-          { name: "🔊 Canal de voz", value: `<#${voiceChannel.id}>`, inline: true },
-          { name: "🛡️ Tomada por", value: requestingMember.displayName, inline: true },
-          ...(attendees.length === 0
-            ? [{ name: "👥 Participantes (0)", value: "No hay miembros conectados.", inline: false }]
-            : []),
+        .setTitle("📋 Asistencia de voz")
+        .setDescription(
+          `🔊 **Canal:** <#${voiceChannel.id}>\n` +
+          `📅 **Fecha y hora:** ${localDate} ET\n` +
+          `🛡️ **Tomó asistencia:** ${requestingMember.displayName}`
         )
         .addFields(participantFields)
-        .setFooter({ text: `ZENTH AION 2 BOT • ${attendees.length} asistentes` })
+        .setFooter({ text: "ZENTH AION 2 BOT • Control de voz" })
         .setTimestamp(now);
       await attendanceChannel.send({ embeds: [attendanceEmbed], allowedMentions: { parse: [] } });
       await interaction.editReply(`Asistencia de **${attendees.length}** persona(s) enviada a <#${ATTENDANCE_CHANNEL_ID}>.`);
