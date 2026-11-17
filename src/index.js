@@ -38,6 +38,11 @@ import {
   removePveGroup,
   updatePveGroup,
 } from "./pve-groups.js";
+import {
+  getDueWorldBossTimers,
+  markWorldBossTimerNotified,
+  setWorldBossTimer,
+} from "./world-boss-timers.js";
 
 // Cargar variables de entorno
 dotenv.config();
@@ -82,6 +87,32 @@ const SLASH_COMMANDS = [
     .setName("eventos")
     .setDescription("Consulta los eventos de esta semana")
     .setDefaultMemberPermissions(null),
+  new SlashCommandBuilder()
+    .setName("temporizador-jefe")
+    .setDescription("Programa un aviso usando el tiempo restante que muestra el juego")
+    .setDefaultMemberPermissions(null)
+    .addStringOption((option) => option
+      .setName("jefe")
+      .setDescription("World Boss de NA East / Zikel")
+      .setRequired(true)
+      .addChoices(
+        { name: "Immortal Gartua", value: "Immortal Gartua" },
+        { name: "High Commander Lagta", value: "High Commander Lagta" },
+        { name: "Soul Ruler Kashapa", value: "Soul Ruler Kashapa" },
+        { name: "Silent Dartan", value: "Silent Dartan" },
+      ))
+    .addIntegerOption((option) => option
+      .setName("minutos")
+      .setDescription("Minutos restantes que muestra el juego (0 a 59)")
+      .setMinValue(0)
+      .setMaxValue(59)
+      .setRequired(true))
+    .addIntegerOption((option) => option
+      .setName("horas")
+      .setDescription("Horas restantes que muestra el juego (opcional)")
+      .setMinValue(0)
+      .setMaxValue(11)
+      .setRequired(false)),
   new SlashCommandBuilder()
     .setName("mejoras")
     .setDescription("Consulta las prioridades de mejora de un personaje")
@@ -305,6 +336,7 @@ function registerWorldBossSchedules() {
     scheduledJobs.push(job);
     console.log(`  ✅ [World Boss] ${boss.name} → ${boss.cron} (${BOT_CONFIG.serverTimezone})`);
   }
+
 }
 
 // ─── Comando !eventos ─────────────────────────────────────────────────────────
@@ -346,6 +378,43 @@ async function checkPriceAlerts() {
     console.error(`❌ No se pudieron cargar las alertas de precio: ${error.message}`);
   } finally {
     checkingPriceAlerts = false;
+  }
+
+  const timerJob = cron.schedule("* * * * *", () => void checkWorldBossRespawns());
+  scheduledJobs.push(timerJob);
+  console.log("  ✅ [World Boss] Revisando temporizadores ingresados cada minuto.");
+}
+
+let checkingWorldBossTimers = false;
+
+async function checkWorldBossRespawns() {
+  if (checkingWorldBossTimers) return;
+  checkingWorldBossTimers = true;
+  try {
+    const dueTimers = await getDueWorldBossTimers();
+    if (dueTimers.length === 0) return;
+
+    const channel = await client.channels.fetch(WORLD_BOSS_CHANNEL_ID);
+    if (!channel?.isTextBased()) {
+      console.error(`❌ No se encontró el canal de World Boss ${WORLD_BOSS_CHANNEL_ID}.`);
+      return;
+    }
+
+    for (const timer of dueTimers) {
+      const spawnTimestamp = Math.floor(Date.parse(timer.spawnAt) / 1000);
+      await channel.send({
+        content:
+          `<@&${WORLD_BOSS_ROLE_ID}> 🔔 **${timer.boss}** reaparecerá <t:${spawnTimestamp}:R> ` +
+          `(<t:${spawnTimestamp}:t> ET · NA East / Zikel).`,
+        allowedMentions: { parse: [], roles: [WORLD_BOSS_ROLE_ID] },
+      });
+      await markWorldBossTimerNotified(timer.id);
+      console.log(`🔔 Aviso de reaparición enviado para ${timer.boss}.`);
+    }
+  } catch (error) {
+    console.error(`❌ No se pudieron procesar los temporizadores de World Boss: ${error.message}`);
+  } finally {
+    checkingWorldBossTimers = false;
   }
 }
 
@@ -499,6 +568,7 @@ function buildHelpEmbed() {
         name: "📋 Generales",
         value:
           "`/eventos` → Muestra el calendario de eventos de la semana\n" +
+          "`/temporizador-jefe` → Programa el aviso de Gartua, Lagta, Kashapa o Dartan con el tiempo del juego\n" +
           "`/mejoras personaje` → Consulta prioridades de mejora para Zikel\n" +
           "`/precio articulo` → Consulta precios publicados en el mercado de Zikel\n" +
           "`/alerta-precio articulo maximo` → Recibe un aviso privado al alcanzar ese precio\n" +
@@ -516,9 +586,10 @@ function buildHelpEmbed() {
           "El bot avisa **1 hora antes** de cada evento:\n" +
           "⚔️ SIEGE → Jueves & Sábados a las **20:00 ET**\n" +
           "👑 Nahma → Viernes & Domingos a las **20:00 ET**\n\n" +
-          "Avisos de World Boss **10 minutos antes**:\n" +
+          "Avisos automáticos de World Boss **10 minutos antes**:\n" +
           "👁️ Watcher Kaira → Cada 3 horas desde la 01:00 ET\n" +
-          "👑 Argo, the Spirit King → Diario a las 10:30 y 22:30 ET",
+          "👑 Argo, the Spirit King → Diario a las 10:30 y 22:30 ET\n" +
+          "Para Gartua, Lagta, Kashapa o Dartan, copia en `/temporizador-jefe` el tiempo restante que muestra el juego.",
         inline: false,
       }
     )
@@ -1256,6 +1327,39 @@ async function handleSlashCommand(interaction) {
     return;
   }
 
+  if (interaction.commandName === "temporizador-jefe") {
+    if (!interaction.guildId) {
+      await interaction.reply({ content: "Este comando solo funciona dentro del servidor.", ephemeral: true });
+      return;
+    }
+    const boss = interaction.options.getString("jefe", true);
+    const hours = interaction.options.getInteger("horas") ?? 0;
+    const minutes = interaction.options.getInteger("minutos", true);
+    if (hours === 0 && minutes === 0) {
+      await interaction.reply({ content: "El tiempo restante debe ser mayor que cero.", ephemeral: true });
+      return;
+    }
+
+    const remainingMinutes = hours * 60 + minutes;
+    const timer = await setWorldBossTimer({
+      guildId: interaction.guildId,
+      boss,
+      remainingMinutes,
+    });
+    const spawnTimestamp = Math.floor(Date.parse(timer.spawnAt) / 1000);
+    const reminderMinutes = Math.max(0, remainingMinutes - 10);
+    await interaction.reply({
+      content:
+        `✅ Temporizador de **${boss}** actualizado con **${hours} h ${minutes} min** restantes. ` +
+        `Reaparecería <t:${spawnTimestamp}:R>; avisaré al rol configurado en <#${WORLD_BOSS_CHANNEL_ID}> ` +
+        (reminderMinutes === 0 ? "ahora, porque faltan 10 minutos o menos." : `en ${reminderMinutes} min.`),
+      ephemeral: true,
+    });
+    void checkWorldBossRespawns();
+    return;
+  }
+
+
   if (PRICE_COMMANDS.has(interaction.commandName) && interaction.channelId !== MARKET_CHANNEL_ID) {
     await interaction.reply({
       content: `Los comandos del mercado solo se pueden usar en <#${MARKET_CHANNEL_ID}>.`,
@@ -1440,7 +1544,7 @@ client.once("clientReady", (bot) => {
   for (const guild of bot.guilds.cache.values()) void registerGuildCommands(guild);
 
   console.log("✅ Bot iniciado correctamente. Esperando eventos...\n");
-  console.log("💬 Comandos: /eventos | /mejoras | /precio | /alerta-precio | /mis-alertas | /quitar-alerta | /buscar-grupo | /ayuda | /test (admin)\n");
+  console.log("💬 Comandos: /eventos | /temporizador-jefe | /mejoras | /precio | /alerta-precio | /mis-alertas | /quitar-alerta | /buscar-grupo | /ayuda | /test (admin)\n");
 });
 
 client.on("guildCreate", (guild) => {
