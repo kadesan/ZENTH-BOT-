@@ -23,7 +23,13 @@ import cron from "node-cron";
 import dotenv from "dotenv";
 import { EVENTS, BOT_CONFIG } from "./events.js";
 import { sendEventNotification } from "./notifier.js";
-import { getCharacterProfile, getUpgradeReport, upgradeCooldownSeconds } from "./upgrades.js";
+import {
+  getCharacterProfile,
+  getUpgradeReport,
+  normalizeKiskRegion,
+  normalizeKiskServer,
+  upgradeCooldownSeconds,
+} from "./upgrades.js";
 import { getMarketItem, searchMarketItems } from "./market.js";
 import {
   createPriceAlert,
@@ -64,6 +70,12 @@ const WORLD_BOSS_CHANNEL_ID = "1572255701538181222";
 const WORLD_BOSS_ROLE_ID = "1565924221194993664";
 const SIEGE_DM_ROLE_ID = "1556537224340832316";
 const ATTENDANCE_CHANNEL_ID = "1570568835508084871";
+const APPLICATION_PANEL_CHANNEL_ID = "1471153320428306593";
+const APPLICATION_CATEGORY_NAME = "═══════  ⋆ SOPORTE⋆ ═════";
+const APPLICATION_STAFF_IDS = ["1146577008109834330", "1266083736936513637"];
+const APPLICATION_BUTTON_ID = "guild-application:open";
+const APPLICATION_MODAL_ID = "guild-application:submit";
+const APPLICATION_CLOSE_BUTTON_ID = "guild-application:close";
 const PVE_CATEGORY_ID = "1135023136904052797";
 const PVE_VOICE_ROLE_IDS = ["1556537224340832316", "1549946232200232971"];
 const PRICE_COMMANDS = new Set(["precio", "alerta-precio", "mis-alertas", "quitar-alerta"]);
@@ -261,6 +273,241 @@ async function registerGuildCommands(guild) {
   } catch (error) {
     console.error(`❌ No se pudieron registrar comandos slash en ${guild.name}: ${error.message}`);
   }
+}
+
+function buildGuildApplicationPanel() {
+  const embed = new EmbedBuilder()
+    .setColor(0xff0000)
+    .setTitle("📨 Postulación a ZENTH")
+    .setDescription(
+      "¿Quieres unirte a la guild? Pulsa el botón y completa el formulario con tu personaje, servidor y región.\n\n" +
+      "El bot buscará el perfil en Kisk y abrirá un ticket privado para que el equipo de reclutamiento revise tu postulación."
+    )
+    .setFooter({ text: "ZENTH AION 2 BOT • Reclutamiento" });
+  const button = new ButtonBuilder()
+    .setCustomId(APPLICATION_BUTTON_ID)
+    .setLabel("Iniciar postulación")
+    .setEmoji("📩")
+    .setStyle(ButtonStyle.Primary);
+  return { embeds: [embed], components: [new ActionRowBuilder().addComponents(button)] };
+}
+
+async function ensureGuildApplicationPanel(guild) {
+  try {
+    const channel = await client.channels.fetch(APPLICATION_PANEL_CHANNEL_ID);
+    if (!channel?.isTextBased() || channel.guildId !== guild.id) return;
+    const messages = await channel.messages.fetch({ limit: 100 });
+    const existingPanel = messages.find((message) =>
+      message.author.id === client.user.id &&
+      message.components.some((row) => row.components.some((component) => component.customId === APPLICATION_BUTTON_ID)));
+    if (existingPanel) {
+      await existingPanel.edit(buildGuildApplicationPanel());
+      console.log(`✅ Panel de postulación verificado en #${channel.name}.`);
+      return;
+    }
+    await channel.send(buildGuildApplicationPanel());
+    console.log(`✅ Panel de postulación publicado en #${channel.name}.`);
+  } catch (error) {
+    console.error(`❌ No se pudo publicar/verificar el panel de postulación: ${error.message}`);
+  }
+}
+
+function buildGuildApplicationModal() {
+  const characterInput = new TextInputBuilder()
+    .setCustomId("character")
+    .setLabel("Nombre del personaje")
+    .setPlaceholder("Ejemplo: Kade")
+    .setStyle(TextInputStyle.Short)
+    .setMinLength(2)
+    .setMaxLength(32)
+    .setRequired(true);
+  const serverInput = new TextInputBuilder()
+    .setCustomId("server")
+    .setLabel("Servidor")
+    .setPlaceholder("Ejemplo: Zikel")
+    .setStyle(TextInputStyle.Short)
+    .setMaxLength(50)
+    .setRequired(true);
+  const regionInput = new TextInputBuilder()
+    .setCustomId("region")
+    .setLabel("Región")
+    .setPlaceholder("NA East, NA West, Europe, South America o Asia")
+    .setStyle(TextInputStyle.Short)
+    .setMaxLength(30)
+    .setRequired(true);
+  return new ModalBuilder()
+    .setCustomId(APPLICATION_MODAL_ID)
+    .setTitle("Postulación a ZENTH")
+    .addComponents(
+      new ActionRowBuilder().addComponents(characterInput),
+      new ActionRowBuilder().addComponents(serverInput),
+      new ActionRowBuilder().addComponents(regionInput),
+    );
+}
+
+async function getApplicationStaffTargets(guild) {
+  const allow = [
+    PermissionFlagsBits.ViewChannel,
+    PermissionFlagsBits.SendMessages,
+    PermissionFlagsBits.ReadMessageHistory,
+    PermissionFlagsBits.AttachFiles,
+    PermissionFlagsBits.EmbedLinks,
+    PermissionFlagsBits.ManageMessages,
+  ];
+  const targets = [];
+  for (const id of APPLICATION_STAFF_IDS) {
+    const role = guild.roles.cache.get(id) ?? await guild.roles.fetch(id).catch(() => null);
+    if (role) {
+      targets.push({ id, mention: `<@&${id}>`, kind: "role", overwrite: { id, allow } });
+      continue;
+    }
+    const member = guild.members.cache.get(id) ?? await guild.members.fetch(id).catch(() => null);
+    if (!member) throw new Error(`El responsable ${id} no se encontró como miembro ni como rol en el servidor.`);
+    targets.push({ id, mention: `<@${id}>`, kind: "user", overwrite: { id, allow } });
+  }
+  return targets;
+}
+
+async function handleGuildApplicationButton(interaction) {
+  if (interaction.channelId !== APPLICATION_PANEL_CHANNEL_ID) {
+    await interaction.reply({ content: "Usa el botón del canal de postulaciones.", ephemeral: true });
+    return;
+  }
+  await interaction.showModal(buildGuildApplicationModal());
+}
+
+async function handleGuildApplicationSubmit(interaction) {
+  if (!interaction.guild) {
+    await interaction.reply({ content: "Este formulario solo funciona dentro del servidor.", ephemeral: true });
+    return;
+  }
+  await interaction.deferReply({ ephemeral: true });
+  let ticketChannel;
+  try {
+    const characterName = interaction.fields.getTextInputValue("character").trim();
+    const serverInput = interaction.fields.getTextInputValue("server").trim();
+    const regionInput = interaction.fields.getTextInputValue("region").trim();
+    const allChannels = await interaction.guild.channels.fetch();
+    const category = allChannels.find((channel) =>
+      channel?.type === ChannelType.GuildCategory && channel.name === APPLICATION_CATEGORY_NAME);
+    if (!category) throw new Error(`No se encontró la categoría “${APPLICATION_CATEGORY_NAME}”.`);
+
+    const existingTicket = allChannels.find((channel) =>
+      channel?.type === ChannelType.GuildText &&
+      channel.parentId === category.id &&
+      channel.topic?.includes(`applicant:${interaction.user.id}`));
+    if (existingTicket) {
+      await interaction.editReply(`Ya tienes una postulación abierta: <#${existingTicket.id}>.`);
+      return;
+    }
+
+    const staffTargets = await getApplicationStaffTargets(interaction.guild);
+    let profile = null;
+    let kiskStatus = "Perfil encontrado";
+    try {
+      const region = normalizeKiskRegion(regionInput);
+      const server = normalizeKiskServer(serverInput);
+      profile = await getCharacterProfile(characterName, { region, server });
+    } catch (error) {
+      kiskStatus = `No se pudo verificar en Kisk: ${error.message}`.slice(0, 1024);
+      console.warn(`⚠️ Kisk no pudo validar la postulación de ${interaction.user.tag}: ${error.message}`);
+    }
+
+    const safeCharacter = characterName.normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .toLocaleLowerCase("en")
+      .replace(/[^\p{L}\p{N}-]+/gu, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 65) || "jugador";
+    const allowApplicant = [
+      PermissionFlagsBits.ViewChannel,
+      PermissionFlagsBits.SendMessages,
+      PermissionFlagsBits.ReadMessageHistory,
+      PermissionFlagsBits.AttachFiles,
+      PermissionFlagsBits.EmbedLinks,
+    ];
+    const botMember = interaction.guild.members.me ?? await interaction.guild.members.fetch(client.user.id);
+    const permissionOverwrites = [
+      { id: interaction.guild.id, deny: [PermissionFlagsBits.ViewChannel] },
+      {
+        id: botMember.id,
+        allow: [...allowApplicant, PermissionFlagsBits.ManageChannels, PermissionFlagsBits.ManageMessages],
+      },
+      { id: interaction.user.id, allow: allowApplicant },
+      ...staffTargets.map((target) => target.overwrite),
+    ];
+    const topic = `Postulación de ${characterName} · applicant:${interaction.user.id} · ${regionInput}/${serverInput}`.slice(0, 1024);
+    ticketChannel = await interaction.guild.channels.create({
+      name: `postulacion-${safeCharacter}`.slice(0, 100),
+      type: ChannelType.GuildText,
+      parent: category.id,
+      topic,
+      permissionOverwrites,
+      reason: `Postulación de ${interaction.user.tag} para ZENTH`,
+    });
+
+    const profileEmbed = new EmbedBuilder()
+      .setColor(0xff0000)
+      .setTitle("📨 Nueva postulación a ZENTH")
+      .setDescription(`Solicitud de <@${interaction.user.id}> para unirse a la guild.`)
+      .addFields(
+        { name: "🎮 Personaje", value: profile?.characterName || characterName, inline: true },
+        { name: "🌎 Región", value: regionInput.slice(0, 100), inline: true },
+        { name: "🖥️ Servidor", value: (profile?.serverName || serverInput).slice(0, 100), inline: true },
+        { name: "⚔️ Clase", value: profile?.className || "No disponible", inline: true },
+        { name: "🛡️ Facción", value: profile?.faction || "No disponible", inline: true },
+        { name: "💪 CP", value: profile?.combatPower || "No disponible", inline: true },
+        { name: "🔎 Verificación Kisk", value: kiskStatus, inline: false },
+      )
+      .setFooter({ text: `Postulación de ${interaction.user.tag}` })
+      .setTimestamp();
+    if (profile?.url) profileEmbed.setURL(profile.url);
+    if (profile?.profileImageUrl) profileEmbed.setThumbnail(profile.profileImageUrl);
+
+    const allowedMentions = { parse: [], users: [interaction.user.id], roles: [] };
+    for (const target of staffTargets) {
+      if (target.kind === "user") allowedMentions.users.push(target.id);
+      else allowedMentions.roles.push(target.id);
+    }
+    const closeButton = new ButtonBuilder()
+      .setCustomId(APPLICATION_CLOSE_BUTTON_ID)
+      .setLabel("Cerrar postulación")
+      .setEmoji("🔒")
+      .setStyle(ButtonStyle.Secondary);
+    await ticketChannel.send({
+      content: `<@${interaction.user.id}> ${staffTargets.map((target) => target.mention).join(" ")}`,
+      embeds: [profileEmbed],
+      components: [new ActionRowBuilder().addComponents(closeButton)],
+      allowedMentions,
+    });
+    await interaction.editReply(`Tu postulación quedó abierta: <#${ticketChannel.id}>.`);
+  } catch (error) {
+    if (ticketChannel) await ticketChannel.delete("No se pudo publicar la información de la postulación").catch(() => {});
+    console.error(`❌ No se pudo crear la postulación: ${error.message}`);
+    await interaction.editReply(`No pude abrir el ticket. ${error.message}`);
+  }
+}
+
+async function handleGuildApplicationClose(interaction) {
+  const ticketChannel = interaction.channel;
+  const applicantId = ticketChannel?.topic?.match(/applicant:(\d{17,20})/)?.[1];
+  if (!interaction.guild || !ticketChannel || ticketChannel.type !== ChannelType.GuildText || !applicantId) {
+    await interaction.reply({ content: "Este botón no pertenece a un ticket de postulación.", ephemeral: true });
+    return;
+  }
+
+  const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+  const isApplicant = interaction.user.id === applicantId;
+  const isStaff = APPLICATION_STAFF_IDS.some((id) =>
+    id === interaction.user.id || member?.roles.cache.has(id));
+  const isAdmin = interaction.memberPermissions?.has(PermissionFlagsBits.Administrator);
+  if (!isApplicant && !isStaff && !isAdmin) {
+    await interaction.reply({ content: "Solo quien postuló, el equipo de reclutamiento o un administrador puede cerrar este ticket.", ephemeral: true });
+    return;
+  }
+
+  await interaction.reply({ content: "🔒 Postulación cerrada. El canal se eliminará.", ephemeral: true });
+  await ticketChannel.delete(`Postulación cerrada por ${interaction.user.tag}`);
 }
 
 // ─── Registro de Crons ────────────────────────────────────────────────────────
@@ -1653,7 +1900,10 @@ client.once("clientReady", (bot) => {
   pveGroupCleanupTimer = setInterval(() => void checkPveGroupsForCleanup(), 30_000);
   void checkPveGroupsForCleanup();
   void refreshAllPveGroupMessages();
-  for (const guild of bot.guilds.cache.values()) void registerGuildCommands(guild);
+  for (const guild of bot.guilds.cache.values()) {
+    void registerGuildCommands(guild);
+    void ensureGuildApplicationPanel(guild);
+  }
 
   console.log("✅ Bot iniciado correctamente. Esperando eventos...\n");
   console.log("💬 Comandos: /eventos | /temporizador-jefe | /mejoras | /precio | /alerta-precio | /mis-alertas | /quitar-alerta | /buscar-grupo | /ayuda | /test (admin)\n");
@@ -1661,6 +1911,7 @@ client.once("clientReady", (bot) => {
 
 client.on("guildCreate", (guild) => {
   void registerGuildCommands(guild);
+  void ensureGuildApplicationPanel(guild);
 });
 
 // ─── Evento: Mensajes ──────────────────────────────────────────────────────────
@@ -1714,6 +1965,34 @@ async function respondMarketAutocomplete(interaction) {
 }
 
 client.on("interactionCreate", (interaction) => {
+  if (interaction.isButton() && interaction.customId === APPLICATION_CLOSE_BUTTON_ID) {
+    handleGuildApplicationClose(interaction).catch(async (error) => {
+      console.error(`❌ No se pudo cerrar la postulación: ${error.message}`);
+      const response = { content: "No se pudo cerrar este ticket. Inténtalo de nuevo.", ephemeral: true };
+      if (interaction.deferred || interaction.replied) await interaction.followUp(response).catch(() => {});
+      else await interaction.reply(response).catch(() => {});
+    });
+    return;
+  }
+
+  if (interaction.isButton() && interaction.customId === APPLICATION_BUTTON_ID) {
+    handleGuildApplicationButton(interaction).catch(async (error) => {
+      console.error(`❌ No se pudo abrir el formulario de postulación: ${error.message}`);
+      await interaction.reply({ content: "No se pudo abrir el formulario. Inténtalo de nuevo.", ephemeral: true }).catch(() => {});
+    });
+    return;
+  }
+
+  if (interaction.isModalSubmit() && interaction.customId === APPLICATION_MODAL_ID) {
+    handleGuildApplicationSubmit(interaction).catch(async (error) => {
+      console.error(`❌ Error procesando la postulación: ${error.message}`);
+      const response = { content: "No se pudo procesar la postulación. Inténtalo de nuevo.", ephemeral: true };
+      if (interaction.deferred || interaction.replied) await interaction.followUp(response).catch(() => {});
+      else await interaction.reply(response).catch(() => {});
+    });
+    return;
+  }
+
   if (interaction.isModalSubmit() && interaction.customId.startsWith("pve:join:")) {
     handlePveGroupJoinModal(interaction).catch(async (error) => {
       console.error("❌ Error al validar personaje para grupo PvE:", error.message);

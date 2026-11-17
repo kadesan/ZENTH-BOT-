@@ -1,5 +1,12 @@
-const REGION = "nae";
-const SERVER = "zikel";
+const DEFAULT_REGION = "nae";
+const DEFAULT_SERVER = "zikel";
+const REGION_ALIASES = new Map([
+  ["nae", "nae"], ["na east", "nae"], ["na-east", "nae"],
+  ["naw", "naw"], ["na west", "naw"], ["na-west", "naw"],
+  ["eu", "eu"], ["europe", "eu"], ["europa", "eu"],
+  ["la", "la"], ["south america", "la"], ["latin america", "la"], ["latinoamerica", "la"],
+  ["as", "as"], ["asia", "as"],
+]);
 const KISK_BASE_URL = "https://kisk.app";
 const CACHE_TTL_MS = 15 * 60 * 1000;
 const USER_COOLDOWN_MS = 30 * 1000;
@@ -102,7 +109,7 @@ function parseRouteCard(html) {
 
 function parseCharacterData(html, characterName, url) {
   const pageName = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i)?.[1];
-  if (!pageName) throw new Error("Kisk no encontró ese personaje en Zikel.");
+  if (!pageName) throw new Error("Kisk no encontró ese personaje en el servidor indicado.");
 
   const hero = html.match(/<section class="hero">([\s\S]*?)<\/section>/i)?.[1] ?? "";
   const classPill = hero.match(/<span class="pill">\s*(Lv\s*\d+\s+[^<]+)<\/span>/i)?.[1];
@@ -156,7 +163,7 @@ async function fetchReportHtml(url) {
     }
 
     if (!response.ok) {
-      if (response.status === 404) throw new Error("Kisk no encontró ese personaje en Zikel.");
+      if (response.status === 404) throw new Error("Kisk no encontró ese personaje en el servidor indicado.");
       throw new Error(`Kisk respondió con un error (${response.status}).`);
     }
 
@@ -174,18 +181,37 @@ export function upgradeCooldownSeconds(userId) {
   return 0;
 }
 
-async function getCharacterData(characterName) {
+export function normalizeKiskRegion(value) {
+  const normalized = String(value || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").trim().toLocaleLowerCase("en");
+  const region = REGION_ALIASES.get(normalized);
+  if (!region) throw new Error("Región no válida. Usa NA East, NA West, Europe, South America o Asia.");
+  return region;
+}
+
+export function normalizeKiskServer(value) {
+  const slug = String(value || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .trim()
+    .toLocaleLowerCase("en")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  if (!slug || slug.length > 50) throw new Error("Nombre de servidor no válido.");
+  return slug;
+}
+
+async function getCharacterData(characterName, { region = DEFAULT_REGION, server = DEFAULT_SERVER } = {}) {
   const normalizedName = characterName.normalize("NFC").trim();
   if (!/^[\p{L}\p{N} .'’_-]{2,32}$/u.test(normalizedName)) throw new Error("Nombre de personaje no válido.");
 
-  const key = normalizedName.toLocaleLowerCase("es");
+  const key = `${region}/${server}/${normalizedName.toLocaleLowerCase("es")}`;
   const cached = cache.get(key);
   if (cached && Date.now() - cached.fetchedAt < CACHE_TTL_MS) return cached;
   if (inFlight.has(key)) return inFlight.get(key);
 
-  const url = `${KISK_BASE_URL}/c/${REGION}/${SERVER}/${encodeURIComponent(normalizedName)}/upgrades`;
+  const url = `${KISK_BASE_URL}/c/${region}/${server}/${encodeURIComponent(normalizedName)}/upgrades`;
   const request = (async () => {
-    const html = await fetchReportHtml(`${KISK_BASE_URL}/api/character/${REGION}/${SERVER}/${encodeURIComponent(normalizedName)}/upgrades`);
+    const html = await fetchReportHtml(`${KISK_BASE_URL}/api/character/${region}/${server}/${encodeURIComponent(normalizedName)}/upgrades`);
     const characterData = parseCharacterData(html, normalizedName, url);
     cache.set(key, characterData);
     if (cache.size > 100) cache.delete(cache.keys().next().value);
@@ -200,8 +226,8 @@ async function getCharacterData(characterName) {
   }
 }
 
-export async function getCharacterProfile(characterName) {
-  const data = await getCharacterData(characterName);
+export async function getCharacterProfile(characterName, options = {}) {
+  const data = await getCharacterData(characterName, options);
   return {
     characterName: data.characterName,
     className: data.className,
