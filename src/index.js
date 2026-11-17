@@ -102,17 +102,17 @@ const SLASH_COMMANDS = [
         { name: "Silent Dartan", value: "Silent Dartan" },
       ))
     .addIntegerOption((option) => option
+      .setName("horas")
+      .setDescription("Horas restantes que muestra el juego")
+      .setMinValue(0)
+      .setMaxValue(11)
+      .setRequired(true))
+    .addIntegerOption((option) => option
       .setName("minutos")
       .setDescription("Minutos restantes que muestra el juego (0 a 59)")
       .setMinValue(0)
       .setMaxValue(59)
-      .setRequired(true))
-    .addIntegerOption((option) => option
-      .setName("horas")
-      .setDescription("Horas restantes que muestra el juego (opcional)")
-      .setMinValue(0)
-      .setMaxValue(11)
-      .setRequired(false)),
+      .setRequired(true)),
   new SlashCommandBuilder()
     .setName("mejoras")
     .setDescription("Consulta las prioridades de mejora de un personaje")
@@ -1333,7 +1333,7 @@ async function handleSlashCommand(interaction) {
       return;
     }
     const boss = interaction.options.getString("jefe", true);
-    const hours = interaction.options.getInteger("horas") ?? 0;
+    const hours = interaction.options.getInteger("horas", true);
     const minutes = interaction.options.getInteger("minutos", true);
     if (hours === 0 && minutes === 0) {
       await interaction.reply({ content: "El tiempo restante debe ser mayor que cero.", ephemeral: true });
