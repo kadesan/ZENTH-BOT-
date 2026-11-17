@@ -572,30 +572,44 @@ async function updateGuildApplicationCard(channel, status, color, decision) {
 async function refreshGuildApplicationTickets(guild) {
   try {
     const allChannels = await guild.channels.fetch();
-    const category = allChannels.find((channel) =>
-      channel?.type === ChannelType.GuildCategory && channel.name === APPLICATION_CATEGORY_NAME);
-    if (!category) return;
-
+    let refreshed = 0;
     for (const channel of allChannels.values()) {
-      if (channel?.type !== ChannelType.GuildText || channel.parentId !== category.id) continue;
-      const application = getGuildApplicationContext(channel);
-      if (!application) continue;
-      if (!channel.topic?.includes(";character:")) {
-        const topic = `applicant:${application.applicantId};character:${encodeURIComponent(application.characterName)};status:${application.status}`;
-        await channel.setTopic(topic.slice(0, 1024));
-      }
-      if (application.status === "closed") {
-        await channel.permissionOverwrites.delete(application.applicantId).catch(() => {});
-      }
+      const isApplicationChannel = channel?.type === ChannelType.GuildText && (
+        channel.topic?.includes("applicant:") ||
+        channel.name.startsWith("postulacion-") ||
+        channel.parent?.name === APPLICATION_CATEGORY_NAME
+      );
+      if (!isApplicationChannel) continue;
+      try {
+        const messages = await channel.messages.fetch({ limit: 50 });
+        const card = messages.find((message) =>
+          message.author.id === client.user.id &&
+          message.embeds.some((embed) => embed.title === "📨 Nueva postulación a ZENTH"));
+        if (!card) continue;
 
-      const messages = await channel.messages.fetch({ limit: 50 });
-      const card = messages.find((message) =>
-        message.author.id === client.user.id &&
-        message.embeds.some((embed) => embed.title === "📨 Nueva postulación a ZENTH"));
-      if (card) {
-        await card.edit({ components: buildApplicationControls(application.status) });
+        const mentionedApplicantId = card.content.match(/<@(\d{17,20})>/)?.[1];
+        const existingApplication = getGuildApplicationContext(channel);
+        const applicantId = existingApplication?.applicantId || mentionedApplicantId;
+        if (!applicantId) continue;
+        const characterName = existingApplication?.characterName ||
+          card.embeds[0].fields.find((field) => field.name === "🎮 Personaje")?.value ||
+          channel.name.replace(/^postulacion-/, "");
+        const status = existingApplication?.status || "pending";
+
+        if (!existingApplication || !channel.topic?.includes(";character:")) {
+          const topic = `applicant:${applicantId};character:${encodeURIComponent(characterName)};status:${status}`;
+          await channel.setTopic(topic.slice(0, 1024));
+        }
+        if (status === "closed") {
+          await channel.permissionOverwrites.delete(applicantId).catch(() => {});
+        }
+        await card.edit({ components: buildApplicationControls(status) });
+        refreshed += 1;
+      } catch (error) {
+        console.warn(`⚠️ No pude actualizar los controles del ticket ${channel.id}: ${error.message}`);
       }
     }
+    console.log(`✅ Controles de postulaciones actualizados en ${refreshed} ticket(s).`);
   } catch (error) {
     console.error(`❌ No se pudieron actualizar los controles de los tickets abiertos: ${error.message}`);
   }
@@ -754,6 +768,7 @@ async function handleGuildApplicationDelete(interaction) {
 
 // ─── Registro de Crons ────────────────────────────────────────────────────────
 let scheduledJobs = [];
+let worldBossSchedulesRegistered = false;
 
 function registerSchedules() {
   console.log("\n📅 Registrando horarios de eventos:\n");
@@ -834,6 +849,8 @@ async function sendSiegeRoleDirectMessages(guild, dayLabel) {
 }
 
 function registerWorldBossSchedules() {
+  if (worldBossSchedulesRegistered) return;
+  worldBossSchedulesRegistered = true;
   const worldBosses = [
     {
       name: "Watcher Kaira",
@@ -871,6 +888,10 @@ function registerWorldBossSchedules() {
     scheduledJobs.push(job);
     console.log(`  ✅ [World Boss] ${boss.name} → ${boss.cron} (${BOT_CONFIG.serverTimezone})`);
   }
+
+  const timerJob = cron.schedule("* * * * *", () => void checkWorldBossRespawns());
+  scheduledJobs.push(timerJob);
+  console.log("  ✅ [World Boss] Revisando temporizadores ingresados cada minuto.");
 
 }
 
@@ -915,12 +936,10 @@ async function checkPriceAlerts() {
     checkingPriceAlerts = false;
   }
 
-  const timerJob = cron.schedule("* * * * *", () => void checkWorldBossRespawns());
-  scheduledJobs.push(timerJob);
-  console.log("  ✅ [World Boss] Revisando temporizadores ingresados cada minuto.");
 }
 
 let checkingWorldBossTimers = false;
+const sentWorldBossReminderKeys = new Set();
 
 async function checkWorldBossRespawns() {
   if (checkingWorldBossTimers) return;
@@ -936,6 +955,8 @@ async function checkWorldBossRespawns() {
     }
 
     for (const timer of dueTimers) {
+      const reminderKey = `${timer.id}:${Math.floor(Date.parse(timer.spawnAt) / 60_000)}`;
+      if (sentWorldBossReminderKeys.has(reminderKey)) continue;
       const spawnTimestamp = Math.floor(Date.parse(timer.spawnAt) / 1000);
       await channel.send({
         content:
@@ -943,6 +964,7 @@ async function checkWorldBossRespawns() {
           `(<t:${spawnTimestamp}:t> ET · NA East / Zikel).`,
         allowedMentions: { parse: [], roles: [WORLD_BOSS_ROLE_ID] },
       });
+      sentWorldBossReminderKeys.add(reminderKey);
       await markWorldBossTimerNotified(timer.id);
       console.log(`🔔 Aviso de reaparición enviado para ${timer.boss}.`);
     }

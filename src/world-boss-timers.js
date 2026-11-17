@@ -36,17 +36,20 @@ export async function setWorldBossTimer({ guildId, boss, remainingMinutes, start
   return serializeWrite(async () => {
     const timers = await loadTimers();
     const spawnAt = startedAt + remainingMinutes * 60 * 1000;
+    const timerId = `${guildId}:${boss}`;
+    const index = timers.findIndex((entry) => entry.id === timerId);
+    const previous = index >= 0 ? timers[index] : null;
+    const sameSpawnWindow = previous && Math.abs(Date.parse(previous.spawnAt) - spawnAt) <= 15 * 60 * 1000;
     const timer = {
-      id: `${guildId}:${boss}`,
+      id: timerId,
       guildId,
       boss,
       remainingMinutes,
       startedAt: new Date(startedAt).toISOString(),
       spawnAt: new Date(spawnAt).toISOString(),
       notifyAt: new Date(Math.max(startedAt, spawnAt - WARNING_LEAD_MS)).toISOString(),
-      notifiedAt: null,
+      notifiedAt: sameSpawnWindow ? previous.notifiedAt : null,
     };
-    const index = timers.findIndex((entry) => entry.id === timer.id);
     if (index >= 0) timers[index] = timer;
     else timers.push(timer);
     await saveTimers(timers);
