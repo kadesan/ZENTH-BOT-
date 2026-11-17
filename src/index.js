@@ -76,6 +76,9 @@ const APPLICATION_STAFF_IDS = ["1146577008109834330", "1266083736936513637"];
 const APPLICATION_BUTTON_ID = "guild-application:open";
 const APPLICATION_MODAL_ID = "guild-application:submit";
 const APPLICATION_CLOSE_BUTTON_ID = "guild-application:close";
+const APPLICATION_APPROVE_BUTTON_ID = "guild-application:approve";
+const APPLICATION_REJECT_BUTTON_ID = "guild-application:reject";
+const APPLICATION_REJECT_MODAL_PREFIX = "guild-application:reject-reason:";
 const PVE_CATEGORY_ID = "1135023136904052797";
 const PVE_VOICE_ROLE_IDS = ["1556537224340832316", "1549946232200232971"];
 const PRICE_COMMANDS = new Set(["precio", "alerta-precio", "mis-alertas", "quitar-alerta"]);
@@ -281,7 +284,7 @@ function buildGuildApplicationPanel() {
     .setTitle("📨 Postulación a ZENTH")
     .setDescription(
       "¿Quieres unirte a la guild? Pulsa el botón y completa el formulario con tu personaje, servidor y región.\n\n" +
-      "El bot buscará el perfil en Kisk y abrirá un ticket privado para que el equipo de reclutamiento revise tu postulación."
+      "Se abrirá un ticket privado para que el equipo de reclutamiento revise tu postulación."
     )
     .setFooter({ text: "ZENTH AION 2 BOT • Reclutamiento" });
   const button = new ButtonBuilder()
@@ -436,7 +439,7 @@ async function handleGuildApplicationSubmit(interaction) {
       { id: interaction.user.id, allow: allowApplicant },
       ...staffTargets.map((target) => target.overwrite),
     ];
-    const topic = `Postulación de ${characterName} · applicant:${interaction.user.id} · ${regionInput}/${serverInput}`.slice(0, 1024);
+    const topic = `applicant:${interaction.user.id};character:${encodeURIComponent(profile?.characterName || characterName)};region:${encodeURIComponent(regionInput)};server:${encodeURIComponent(serverInput)}`.slice(0, 1024);
     ticketChannel = await interaction.guild.channels.create({
       name: `postulacion-${safeCharacter}`.slice(0, 100),
       type: ChannelType.GuildText,
@@ -474,18 +477,179 @@ async function handleGuildApplicationSubmit(interaction) {
       .setLabel("Cerrar postulación")
       .setEmoji("🔒")
       .setStyle(ButtonStyle.Secondary);
+    const approveButton = new ButtonBuilder()
+      .setCustomId(APPLICATION_APPROVE_BUTTON_ID)
+      .setLabel("Aprobar")
+      .setEmoji("✅")
+      .setStyle(ButtonStyle.Success);
+    const rejectButton = new ButtonBuilder()
+      .setCustomId(APPLICATION_REJECT_BUTTON_ID)
+      .setLabel("Rechazar")
+      .setEmoji("❌")
+      .setStyle(ButtonStyle.Danger);
     await ticketChannel.send({
       content: `<@${interaction.user.id}> ${staffTargets.map((target) => target.mention).join(" ")}`,
       embeds: [profileEmbed],
-      components: [new ActionRowBuilder().addComponents(closeButton)],
+      components: [
+        new ActionRowBuilder().addComponents(approveButton, rejectButton),
+        new ActionRowBuilder().addComponents(closeButton),
+      ],
       allowedMentions,
     });
-    await interaction.editReply(`Tu postulación quedó abierta: <#${ticketChannel.id}>.`);
+    let nicknameNote = "";
+    try {
+      const applicant = await interaction.guild.members.fetch(interaction.user.id);
+      await applicant.setNickname(profile?.characterName || characterName, "Nombre de personaje de la postulación");
+      nicknameNote = ` También actualicé tu apodo del servidor a **${profile?.characterName || characterName}**.`;
+    } catch (error) {
+      nicknameNote = " No pude cambiar tu apodo; un administrador puede actualizarlo manualmente.";
+      console.warn(`⚠️ No se pudo actualizar el apodo de ${interaction.user.tag}: ${error.message}`);
+    }
+    await interaction.editReply(`Tu postulación quedó abierta: <#${ticketChannel.id}>.${nicknameNote}`);
   } catch (error) {
     if (ticketChannel) await ticketChannel.delete("No se pudo publicar la información de la postulación").catch(() => {});
     console.error(`❌ No se pudo crear la postulación: ${error.message}`);
     await interaction.editReply(`No pude abrir el ticket. ${error.message}`);
   }
+}
+
+function buildApplicationCloseRow() {
+  const closeButton = new ButtonBuilder()
+    .setCustomId(APPLICATION_CLOSE_BUTTON_ID)
+    .setLabel("Cerrar postulación")
+    .setEmoji("🔒")
+    .setStyle(ButtonStyle.Secondary);
+  return new ActionRowBuilder().addComponents(closeButton);
+}
+
+function getGuildApplicationContext(channel) {
+  const applicantId = channel?.topic?.match(/(?:^|;)applicant:(\d{17,20})(?:;|$)/)?.[1];
+  const encodedCharacter = channel?.topic?.match(/(?:^|;)character:([^;]+)(?:;|$)/)?.[1];
+  const status = channel?.topic?.match(/(?:^|;)status:(pending|approved|rejected)(?:;|$)/)?.[1] || "pending";
+  if (!applicantId) return null;
+  let characterName = channel.name.replace(/^postulacion-/, "");
+  if (encodedCharacter) {
+    try {
+      characterName = decodeURIComponent(encodedCharacter);
+    } catch {
+      // Si el tema guardado no se puede decodificar, se usa el nombre del canal.
+    }
+  }
+  return { applicantId, characterName, status };
+}
+
+async function updateGuildApplicationCard(channel, status, color, decision) {
+  const topic = (channel.topic || "").replace(/;status:(?:pending|approved|rejected)/g, "");
+  await channel.setTopic(`${topic};status:${decision}`.slice(0, 1024));
+  const messages = await channel.messages.fetch({ limit: 50 });
+  const card = messages.find((message) =>
+    message.author.id === client.user.id &&
+    message.embeds.some((embed) => embed.title === "📨 Nueva postulación a ZENTH"));
+  if (!card) return;
+  const embed = EmbedBuilder.from(card.embeds[0])
+    .setColor(color)
+    .addFields({ name: "📌 Estado", value: status, inline: false });
+  await card.edit({ embeds: [embed], components: [buildApplicationCloseRow()] });
+}
+
+async function canDecideGuildApplication(interaction) {
+  if (interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) return true;
+  if (APPLICATION_STAFF_IDS.includes(interaction.user.id)) return true;
+  const member = await interaction.guild?.members.fetch(interaction.user.id).catch(() => null);
+  return APPLICATION_STAFF_IDS.some((id) => member?.roles.cache.has(id));
+}
+
+function buildApplicationRejectionModal(channelId) {
+  const reasonInput = new TextInputBuilder()
+    .setCustomId("reason")
+    .setLabel("Motivo del rechazo")
+    .setPlaceholder("Explica brevemente por qué no fue aceptada la postulación")
+    .setStyle(TextInputStyle.Paragraph)
+    .setMinLength(5)
+    .setMaxLength(1000)
+    .setRequired(true);
+  return new ModalBuilder()
+    .setCustomId(`${APPLICATION_REJECT_MODAL_PREFIX}${channelId}`)
+    .setTitle("Rechazar postulación")
+    .addComponents(new ActionRowBuilder().addComponents(reasonInput));
+}
+
+async function handleGuildApplicationDecisionButton(interaction, decision) {
+  if (!(await canDecideGuildApplication(interaction))) {
+    await interaction.reply({ content: "Solo los administradores o el equipo de reclutamiento pueden aprobar o rechazar postulaciones.", ephemeral: true });
+    return;
+  }
+  const channel = interaction.channel;
+  const application = getGuildApplicationContext(channel);
+  if (!interaction.guild || !channel || channel.type !== ChannelType.GuildText || !application) {
+    await interaction.reply({ content: "Este botón no pertenece a un ticket de postulación válido.", ephemeral: true });
+    return;
+  }
+  if (application.status !== "pending") {
+    await interaction.reply({ content: "Esta postulación ya tiene una decisión registrada.", ephemeral: true });
+    return;
+  }
+
+  if (decision === "reject") {
+    await interaction.showModal(buildApplicationRejectionModal(channel.id));
+    return;
+  }
+
+  await interaction.deferReply({ ephemeral: true });
+  const applicant = await interaction.guild.members.fetch(application.applicantId).catch(() => null);
+  if (applicant) {
+    try {
+      await applicant.setNickname(application.characterName, "Postulación a ZENTH aprobada");
+    } catch (error) {
+      console.warn(`⚠️ No se pudo actualizar el apodo al aprobar a ${applicant.user.tag}: ${error.message}`);
+    }
+  }
+  await channel.send({
+    content:
+      `<@${application.applicantId}> ✅ **¡Tu postulación ha sido aprobada!** ` +
+      `Ya puedes aplicar **a la guild ZENTH dentro del juego**.`,
+    allowedMentions: { parse: [], users: [application.applicantId] },
+  });
+  await updateGuildApplicationCard(channel, "✅ Aprobada", 0x2ecc71, "approved");
+  await interaction.editReply(
+    applicant
+      ? `Postulación aprobada. El apodo del servidor quedó como **${application.characterName}**.`
+      : "Postulación aprobada. La persona ya no está en el servidor, así que no pude actualizar su apodo."
+  );
+}
+
+async function handleGuildApplicationRejectionSubmit(interaction) {
+  if (!(await canDecideGuildApplication(interaction))) {
+    await interaction.reply({ content: "Solo los administradores o el equipo de reclutamiento pueden rechazar postulaciones.", ephemeral: true });
+    return;
+  }
+  await interaction.deferReply({ ephemeral: true });
+  const channelId = interaction.customId.slice(APPLICATION_REJECT_MODAL_PREFIX.length);
+  const channel = await client.channels.fetch(channelId).catch(() => null);
+  const application = getGuildApplicationContext(channel);
+  if (!interaction.guild || !channel || channel.guildId !== interaction.guildId ||
+      channel.type !== ChannelType.GuildText || !application) {
+    await interaction.editReply("No encontré el ticket asociado a este rechazo.");
+    return;
+  }
+  if (application.status !== "pending") {
+    await interaction.editReply("Esta postulación ya tiene una decisión registrada.");
+    return;
+  }
+
+  const reason = interaction.fields.getTextInputValue("reason").trim();
+  if (reason.length < 5) {
+    await interaction.editReply("Escribe un motivo de al menos 5 caracteres.");
+    return;
+  }
+  await channel.send({
+    content:
+      `<@${application.applicantId}> ❌ **Tu postulación no fue aceptada.**\n` +
+      `**Motivo:** ${reason}`,
+    allowedMentions: { parse: [], users: [application.applicantId] },
+  });
+  await updateGuildApplicationCard(channel, "❌ Rechazada", 0xe74c3c, "rejected");
+  await interaction.editReply("Rechazo enviado al ticket con el motivo indicado.");
 }
 
 async function handleGuildApplicationClose(interaction) {
@@ -1965,6 +2129,34 @@ async function respondMarketAutocomplete(interaction) {
 }
 
 client.on("interactionCreate", (interaction) => {
+  if (interaction.isButton() && interaction.customId === APPLICATION_APPROVE_BUTTON_ID) {
+    handleGuildApplicationDecisionButton(interaction, "approve").catch(async (error) => {
+      console.error("❌ No se pudo aprobar la postulación:", error.message);
+      const response = { content: "No se pudo aprobar la postulación. Inténtalo de nuevo.", ephemeral: true };
+      if (interaction.deferred || interaction.replied) await interaction.followUp(response).catch(() => {});
+      else await interaction.reply(response).catch(() => {});
+    });
+    return;
+  }
+
+  if (interaction.isButton() && interaction.customId === APPLICATION_REJECT_BUTTON_ID) {
+    handleGuildApplicationDecisionButton(interaction, "reject").catch(async (error) => {
+      console.error("❌ No se pudo abrir el formulario de rechazo:", error.message);
+      await interaction.reply({ content: "No se pudo abrir el formulario de rechazo.", ephemeral: true }).catch(() => {});
+    });
+    return;
+  }
+
+  if (interaction.isModalSubmit() && interaction.customId.startsWith(APPLICATION_REJECT_MODAL_PREFIX)) {
+    handleGuildApplicationRejectionSubmit(interaction).catch(async (error) => {
+      console.error("❌ No se pudo registrar el rechazo:", error.message);
+      const response = { content: "No se pudo registrar el rechazo. Inténtalo de nuevo.", ephemeral: true };
+      if (interaction.deferred || interaction.replied) await interaction.followUp(response).catch(() => {});
+      else await interaction.reply(response).catch(() => {});
+    });
+    return;
+  }
+
   if (interaction.isButton() && interaction.customId === APPLICATION_CLOSE_BUTTON_ID) {
     handleGuildApplicationClose(interaction).catch(async (error) => {
       console.error(`❌ No se pudo cerrar la postulación: ${error.message}`);
