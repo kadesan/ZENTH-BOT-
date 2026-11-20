@@ -37,6 +37,8 @@ import {
 } from "./upgrades.js";
 import { getSielCharacterProfile } from "./siel.js";
 import { renderProfileCard } from "./profile-card.js";
+import { getGuildRanking } from "./guild-ranking.js";
+import { renderGuildRankingCard } from "./guild-ranking-card.js";
 import { getMarketItem, searchMarketItems } from "./market.js";
 import {
   createPriceAlert,
@@ -75,6 +77,8 @@ const MENTION_ROLE = process.env.MENTION_ROLE || "";
 const MARKET_CHANNEL_ID = "1571056334038630561";
 const WORLD_BOSS_CHANNEL_ID = "1572255701538181222";
 const WORLD_BOSS_ROLE_ID = "1565924221194993664";
+const GUILD_RANKING_CHANNEL_ID = "1562777914548953118";
+const GUILD_RANKING_STATE_PATH = path.join(process.cwd(), "data", "guild-ranking-message.json");
 const SCHEDULER_LEASE_PATH = path.join(process.cwd(), "data", "scheduler-lease.json");
 const SCHEDULER_LEASE_MS = 90_000;
 const SCHEDULER_HEARTBEAT_MS = 30_000;
@@ -795,6 +799,7 @@ let ownsSchedulerLease = false;
 let schedulerJobsRegistered = false;
 let schedulerRetryTimer = null;
 let schedulerRetryRunning = false;
+let updatingGuildRanking = false;
 
 async function acquireSchedulerLease({ quiet = false } = {}) {
   await mkdir(path.dirname(SCHEDULER_LEASE_PATH), { recursive: true });
@@ -895,6 +900,92 @@ async function releaseSchedulerLease() {
   }
 }
 
+function buildGuildRankingEmbed(ranking) {
+  const updatedAt = Math.floor(ranking.fetchedAt / 1000);
+  const rankDetails = [
+    ranking.rankServer && `**#${ranking.rankServer} en Zikel**`,
+    ranking.rankRegion && `**#${ranking.rankRegion} en NA East**`,
+  ].filter(Boolean).join(" · ");
+  const embed = new EmbedBuilder()
+    .setColor(0xc92d3a)
+    .setTitle("🏆 Ranking de ZENTH")
+    .setURL(ranking.url)
+    .setDescription(
+      `${rankDetails ? `${rankDetails} · ` : ""}**${ranking.memberCount} personajes vistos por Siel**\n` +
+      `Ordenado por poder de combate. Se actualiza cada cinco minutos.\n` +
+      `Última consulta: <t:${updatedAt}:R>`
+    )
+    .setImage("attachment://zenth-ranking.jpg")
+    .setFooter({ text: "ZENTH AION 2 BOT · Fuente: Siel" })
+    .setTimestamp(new Date(ranking.fetchedAt));
+  return embed;
+}
+
+function buildGuildRankingControls() {
+  const openRanking = new ButtonBuilder()
+    .setLabel("Abrir ranking en Siel")
+    .setEmoji("🌐")
+    .setStyle(ButtonStyle.Link)
+    .setURL("https://siel.tools/guild/nae/zikel/Zenth");
+  return new ActionRowBuilder().addComponents(openRanking);
+}
+
+async function saveGuildRankingMessageId(messageId) {
+  await mkdir(path.dirname(GUILD_RANKING_STATE_PATH), { recursive: true });
+  const temporaryPath = `${GUILD_RANKING_STATE_PATH}.tmp`;
+  await writeFile(temporaryPath, JSON.stringify({ channelId: GUILD_RANKING_CHANNEL_ID, messageId }), "utf8");
+  await rename(temporaryPath, GUILD_RANKING_STATE_PATH);
+}
+
+async function findGuildRankingMessage(channel) {
+  try {
+    const saved = JSON.parse(await readFile(GUILD_RANKING_STATE_PATH, "utf8"));
+    if (saved.channelId === channel.id && saved.messageId) {
+      const message = await channel.messages.fetch(saved.messageId).catch(() => null);
+      if (message?.author.id === client.user.id) return message;
+    }
+  } catch {
+    // Si el estado local falta o el mensaje se borró, se busca en mensajes recientes.
+  }
+
+  const recentMessages = await channel.messages.fetch({ limit: 100 });
+  return recentMessages.find((message) =>
+    message.author.id === client.user.id &&
+    message.embeds.some((embed) => embed.title === "🏆 Ranking de ZENTH")) || null;
+}
+
+async function updateGuildRanking() {
+  if (!ownsSchedulerLease || updatingGuildRanking) return;
+  updatingGuildRanking = true;
+  try {
+    const ranking = await getGuildRanking();
+    const image = await renderGuildRankingCard(ranking);
+    const channel = await client.channels.fetch(GUILD_RANKING_CHANNEL_ID);
+    if (!channel?.isTextBased() || !channel.messages || !channel.send) {
+      throw new Error(`El canal ${GUILD_RANKING_CHANNEL_ID} no es un canal de texto disponible.`);
+    }
+
+    const attachment = new AttachmentBuilder(image, { name: "zenth-ranking.jpg" });
+    const payload = {
+      embeds: [buildGuildRankingEmbed(ranking)],
+      components: [buildGuildRankingControls()],
+      files: [attachment],
+    };
+    let message = await findGuildRankingMessage(channel);
+    if (message) {
+      message = await message.edit({ ...payload, attachments: [] });
+    } else {
+      message = await channel.send(payload);
+    }
+    await saveGuildRankingMessageId(message.id);
+    console.log(`✅ Ranking de ZENTH actualizado en el canal ${GUILD_RANKING_CHANNEL_ID} (${ranking.members.length} miembros).`);
+  } catch (error) {
+    console.error(`❌ No se pudo actualizar el ranking de ZENTH: ${error.message}`);
+  } finally {
+    updatingGuildRanking = false;
+  }
+}
+
 function startScheduledJobs() {
   if (!ownsSchedulerLease || schedulerJobsRegistered) return;
   schedulerJobsRegistered = true;
@@ -905,6 +996,12 @@ function startScheduledJobs() {
   });
   scheduledJobs.push(priceAlertJob);
   void checkPriceAlerts();
+  const guildRankingJob = cron.schedule("*/5 * * * *", () => void updateGuildRanking(), {
+    timezone: BOT_CONFIG.serverTimezone,
+  });
+  scheduledJobs.push(guildRankingJob);
+  void updateGuildRanking();
+  console.log(`  ✅ [Guild ranking] ZENTH → actualizando cada 5 minutos en ${GUILD_RANKING_CHANNEL_ID}`);
 }
 
 function scheduleSchedulerRetry() {
@@ -1304,6 +1401,7 @@ function buildHelpEmbed() {
           "El bot avisa **1 hora antes** de cada evento:\n" +
           "⚔️ SIEGE → Jueves & Sábados a las **20:00 ET**\n" +
           "👑 Nahma → Viernes & Domingos a las **20:00 ET**\n\n" +
+          `🏆 Ranking de ZENTH → se actualiza cada 5 minutos en <#${GUILD_RANKING_CHANNEL_ID}>.\n` +
           "Avisos automáticos de World Boss **10 minutos antes**:\n" +
           "👁️ Watcher Kaira → Cada 3 horas desde la 01:00 ET\n" +
           "👑 Argo, the Spirit King → Diario a las 10:30 y 22:30 ET\n" +
