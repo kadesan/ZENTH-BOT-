@@ -5,3 +5,7 @@ data/price-alerts.json
 data/price-alerts.json.tmp
 data/pve-groups.json
 data/pve-groups.json.tmp
+data/world-boss-timers.json
+data/world-boss-timers.json.tmp
+data/scheduler-lease.json
+data/scheduler-lease.json.*.stale

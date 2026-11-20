@@ -1,4 +1,5 @@
 import sharp from "sharp";
+import { readFile } from "node:fs/promises";
 
 const ATTRIBUTE_STATS = [
   ["Might", "STR"],
@@ -69,7 +70,7 @@ async function fetchPortraitData(portraitUrl) {
   }
 }
 
-function buildCardSvg(profile, portraitData) {
+function buildCardSvg(profile, portraitData, logoData) {
   const { player, snapshot } = profile;
   const stats = snapshot.stats || {};
   const daevanion = new Map((snapshot.daevanion || []).map((board) => [Number(board.id), board]));
@@ -111,29 +112,38 @@ function buildCardSvg(profile, portraitData) {
     return `${text(x, y, label, 12, "#d9d1e7", 600)}<rect x="${x + 92}" y="${y - 8}" width="200" height="7" rx="3.5" fill="#342b42"/><rect x="${x + 92}" y="${y - 8}" width="${barWidth}" height="7" rx="3.5" fill="url(#bar)"/>${text(x + 320, y, `${open}/${total} · ${percent}`, 11, "#eee8f8", 600, 'text-anchor="end"')}`;
   }).join("");
 
-  const snapshotDate = snapshot.at ? new Intl.DateTimeFormat("es-CO", {
+  const checkedAt = player.checkedAt || snapshot.at;
+  const snapshotDate = checkedAt ? new Intl.DateTimeFormat("es-CO", {
     dateStyle: "medium",
     timeStyle: "short",
     timeZone: "UTC",
-  }).format(new Date(snapshot.at)) : "Actualización no disponible";
+  }).format(new Date(checkedAt)) : "sin fecha";
+  const refreshLabel = profile.refreshStatus === "updated"
+    ? "actualizado ahora"
+    : profile.refreshStatus === "stale"
+      ? "Siel no pudo actualizar"
+      : "Siel al día";
   const guild = player.guild || snapshot.guild || "Sin legión";
   const title = player.title || "";
   const grade = player.titleGrade ? ` · ${player.titleGrade}` : "";
 
   return `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="675" viewBox="0 0 1200 675">
   <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#100a1b"/><stop offset="0.55" stop-color="#21132c"/><stop offset="1" stop-color="#100d20"/></linearGradient>
-    <linearGradient id="bar" x1="0" x2="1"><stop stop-color="#c94868"/><stop offset="1" stop-color="#b68adf"/></linearGradient>
-    <linearGradient id="border" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#d57091"/><stop offset="0.5" stop-color="#8157a5"/><stop offset="1" stop-color="#d1a365"/></linearGradient>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#10090c"/><stop offset="0.55" stop-color="#241014"/><stop offset="1" stop-color="#100a0d"/></linearGradient>
+    <linearGradient id="bar" x1="0" x2="1"><stop stop-color="#e62432"/><stop offset="1" stop-color="#ff8175"/></linearGradient>
+    <linearGradient id="border" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#ff636c"/><stop offset="0.5" stop-color="#8f202a"/><stop offset="1" stop-color="#e9aaa1"/></linearGradient>
     <clipPath id="portraitClip"><rect x="986" y="76" width="154" height="154" rx="22"/></clipPath>
     <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%"><feDropShadow dx="0" dy="8" stdDeviation="12" flood-color="#000" flood-opacity=".4"/></filter>
+    <filter id="logoGlow" x="-40%" y="-40%" width="180%" height="180%"><feDropShadow dx="0" dy="0" stdDeviation="5" flood-color="#ff1e2d" flood-opacity=".55"/></filter>
   </defs>
   <rect width="1200" height="675" fill="url(#bg)"/>
+  <path d="M0 100 320 0h280L0 190ZM1200 470 900 675H700l500-310Z" fill="#a71c2a" opacity=".055"/>
   <path d="M22 80V22h80M1098 22h80v58M22 595v58h80M1098 653h80v-58" fill="none" stroke="url(#border)" stroke-width="2" opacity=".85"/>
   <rect x="25" y="25" width="1150" height="625" rx="22" fill="none" stroke="url(#border)" stroke-width="2" opacity=".74"/>
-  <path d="M48 76H1152" stroke="#6f4a7b" stroke-width="1" opacity=".7"/>
-  ${text(60, 57, "ZENTH AION 2  ·  FICHA DE PERSONAJE", 19, "#e3b3c7", 700, 'letter-spacing="2"')}
-  ${text(1140, 57, "NA EAST  /  ZIKEL", 13, "#b9adc9", 700, 'text-anchor="end" letter-spacing="1.5"')}
+  <path d="M48 76H1152" stroke="#6f333b" stroke-width="1" opacity=".9"/>
+  <image href="data:image/png;base64,${logoData}" x="52" y="27" width="42" height="55" preserveAspectRatio="xMidYMid meet" filter="url(#logoGlow)"/>
+  ${text(112, 57, "ZENTH AION 2  ·  FICHA DE PERSONAJE", 19, "#ffd1d3", 700, 'letter-spacing="2"')}
+  ${text(1140, 57, "NA EAST  /  ZIKEL", 13, "#c8b7b8", 700, 'text-anchor="end" letter-spacing="1.5"')}
   ${text(62, 137, player.name || snapshot.name, 48, "#fff7ff", 700)}
   ${text(64, 174, `Nv. ${player.level ?? snapshot.level ?? "—"}  ·  ${player.className || snapshot.className || "Clase sin datos"}`, 18, "#e4d9ef", 600)}
   ${text(64, 204, `${player.raceId === 2 || snapshot.raceId === 2 ? "Asmodians" : "Elyos"}  ·  ${guild}`, 14, "#afa4bf", 500)}
@@ -141,31 +151,34 @@ function buildCardSvg(profile, portraitData) {
   <rect x="978" y="68" width="170" height="170" rx="28" fill="#171020" stroke="url(#border)" stroke-width="2" filter="url(#shadow)"/>
   ${portrait}
   <rect x="986" y="76" width="154" height="154" rx="22" fill="none" stroke="#ffffff" stroke-opacity=".2"/>
-  <rect x="54" y="252" width="350" height="74" rx="14" fill="#21192c" stroke="#694b74"/>
-  <rect x="425" y="252" width="350" height="74" rx="14" fill="#21192c" stroke="#694b74"/>
-  <rect x="796" y="252" width="350" height="74" rx="14" fill="#21192c" stroke="#694b74"/>
-  ${text(76, 278, "PODER DE COMBATE", 12, "#b9a9c8", 700, 'letter-spacing="1.2"')}
+  <rect x="54" y="252" width="350" height="74" rx="14" fill="#26181d" stroke="#71343b"/>
+  <rect x="425" y="252" width="350" height="74" rx="14" fill="#26181d" stroke="#71343b"/>
+  <rect x="796" y="252" width="350" height="74" rx="14" fill="#26181d" stroke="#71343b"/>
+  ${text(76, 278, "PODER DE COMBATE", 12, "#ccb8bb", 700, 'letter-spacing="1.2"')}
   ${text(76, 310, formatNumber(player.combatPower ?? snapshot.combatPower), 26, "#fff7ff", 700)}
-  ${text(447, 278, "NIVEL DE OBJETO", 12, "#b9a9c8", 700, 'letter-spacing="1.2"')}
+  ${text(447, 278, "NIVEL DE OBJETO", 12, "#ccb8bb", 700, 'letter-spacing="1.2"')}
   ${text(447, 310, formatNumber(player.itemLevel ?? snapshot.itemLevel), 26, "#fff7ff", 700)}
-  ${text(818, 278, "PROGRESO · 7 DÍAS", 12, "#b9a9c8", 700, 'letter-spacing="1.2"')}
+  ${text(818, 278, "PROGRESO · 7 DÍAS", 12, "#ccb8bb", 700, 'letter-spacing="1.2"')}
   ${text(818, 310, `+${formatNumber(player.gain7d || 0)} CP`, 26, "#fff7ff", 700)}
-  <rect x="54" y="344" width="520" height="195" rx="14" fill="#171321" stroke="#45344f"/>
-  <rect x="594" y="344" width="552" height="195" rx="14" fill="#171321" stroke="#45344f"/>
-  ${text(76, 377, "ATRIBUTOS", 15, "#f3d4e1", 700, 'letter-spacing="1.5"')}
-  ${text(616, 377, "ESTADÍSTICAS DIVINAS", 15, "#f3d4e1", 700, 'letter-spacing="1.5"')}
+  <rect x="54" y="344" width="520" height="195" rx="14" fill="#181215" stroke="#573239"/>
+  <rect x="594" y="344" width="552" height="195" rx="14" fill="#181215" stroke="#573239"/>
+  ${text(76, 377, "ATRIBUTOS", 15, "#ffd0d3", 700, 'letter-spacing="1.5"')}
+  ${text(616, 377, "ESTADÍSTICAS DIVINAS", 15, "#ffd0d3", 700, 'letter-spacing="1.5"')}
   ${attributeRows}
   ${divineRows}
-  <rect x="54" y="552" width="1092" height="88" rx="14" fill="#171321" stroke="#45344f"/>
-  ${text(76, 580, "DAEVANION", 14, "#f3d4e1", 700, 'letter-spacing="1.5"')}
+  <rect x="54" y="552" width="1092" height="88" rx="14" fill="#181215" stroke="#573239"/>
+  ${text(76, 580, "DAEVANION", 14, "#ffd0d3", 700, 'letter-spacing="1.5"')}
   ${daevaRows}
-  ${text(60, 665, `Fuente: Siel · Datos de personaje · Actualizado ${snapshotDate}`, 11, "#9e91ad", 500)}
-  ${text(1140, 665, "ZENTH", 11, "#d7b3c5", 700, 'text-anchor="end" letter-spacing="2"')}
+  ${text(60, 665, `Fuente: Siel · ${refreshLabel} · Consultado ${snapshotDate} UTC`, 11, "#b19fa2", 500)}
+  ${text(1140, 665, "ZENTH", 11, "#ffb7bc", 700, 'text-anchor="end" letter-spacing="2"')}
 </svg>`;
 }
 
 export async function renderProfileCard(profile) {
-  const portraitData = await fetchPortraitData(profile.player.portrait);
-  const svg = buildCardSvg(profile, portraitData);
+  const [portraitData, logo] = await Promise.all([
+    fetchPortraitData(profile.player.portrait),
+    readFile(new URL("../assets/zenth-shield.png", import.meta.url)),
+  ]);
+  const svg = buildCardSvg(profile, portraitData, logo.toString("base64"));
   return sharp(Buffer.from(svg)).png().toBuffer();
 }
