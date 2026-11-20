@@ -7,6 +7,7 @@ import {
   Client,
   GatewayIntentBits,
   ActivityType,
+  AttachmentBuilder,
   EmbedBuilder,
   ActionRowBuilder,
   ButtonBuilder,
@@ -34,6 +35,8 @@ import {
   normalizeKiskServer,
   upgradeCooldownSeconds,
 } from "./upgrades.js";
+import { getSielCharacterProfile } from "./siel.js";
+import { renderProfileCard } from "./profile-card.js";
 import { getMarketItem, searchMarketItems } from "./market.js";
 import {
   createPriceAlert,
@@ -151,6 +154,16 @@ const SLASH_COMMANDS = [
     .addStringOption((option) => option
       .setName("personaje")
       .setDescription("Nombre del personaje en NA East / Zikel")
+      .setMinLength(2)
+      .setMaxLength(32)
+      .setRequired(true)),
+  new SlashCommandBuilder()
+    .setName("perfil")
+    .setDescription("Genera una ficha gráfica de un personaje de Zikel")
+    .setDefaultMemberPermissions(null)
+    .addStringOption((option) => option
+      .setName("personaje")
+      .setDescription("Nombre exacto del personaje en NA East / Zikel")
       .setMinLength(2)
       .setMaxLength(32)
       .setRequired(true)),
@@ -1274,6 +1287,7 @@ function buildHelpEmbed() {
           "`/asistencia` → Envía al canal de registro la fecha y la lista de personas en tu voz\n" +
           "`/temporizador-jefe` → Programa el aviso de Gartua, Lagta, Kashapa o Dartan con el tiempo del juego\n" +
           "`/mejoras personaje` → Consulta prioridades de mejora para Zikel\n" +
+          "`/perfil personaje` → Genera una ficha gráfica con CP, atributos y Daevanion de Siel\n" +
           "`/precio articulo` → Consulta precios publicados en el mercado de Zikel\n" +
           "`/alerta-precio articulo maximo` → Recibe un aviso privado al alcanzar ese precio\n" +
           "`/mis-alertas` y `/quitar-alerta id` → Administra tus alertas (máximo 5)\n" +
@@ -2142,6 +2156,33 @@ async function handleSlashCommand(interaction) {
     return;
   }
 
+  if (interaction.commandName === "perfil") {
+    const characterName = interaction.options.getString("personaje", true).trim();
+    await interaction.deferReply();
+    try {
+      const profile = await getSielCharacterProfile(characterName);
+      const image = await renderProfileCard(profile);
+      const safeName = profile.player.name.normalize("NFD")
+        .replace(/[\u0300-\u036f]/g, "")
+        .replace(/[^\p{L}\p{N}-]+/gu, "-")
+        .replace(/^-+|-+$/g, "")
+        .slice(0, 48) || "personaje";
+      const fileName = `ficha-${safeName}.png`;
+      const attachment = new AttachmentBuilder(image, { name: fileName });
+      const embed = new EmbedBuilder()
+        .setColor(0x8b4d9f)
+        .setTitle(`📜 Ficha de ${profile.player.name}`)
+        .setURL(profile.url)
+        .setImage(`attachment://${fileName}`)
+        .setFooter({ text: "ZENTH AION 2 BOT • Datos públicos consultados en Siel" });
+      await interaction.editReply({ embeds: [embed], files: [attachment] });
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : "No se pudo generar la ficha.";
+      await interaction.editReply(`No pude crear la ficha de **${characterName}**. ${detail}`);
+    }
+    return;
+  }
+
   if (interaction.commandName === "ayuda") {
     await interaction.reply({ embeds: [buildHelpEmbed()] });
     return;
@@ -2320,7 +2361,7 @@ client.once("clientReady", async (bot) => {
   }
 
   console.log("✅ Bot iniciado correctamente. Esperando eventos...\n");
-  console.log("💬 Comandos: /eventos | /temporizador-jefe | /mejoras | /precio | /alerta-precio | /mis-alertas | /quitar-alerta | /buscar-grupo | /ayuda | /test (admin)\n");
+  console.log("💬 Comandos: /eventos | /temporizador-jefe | /mejoras | /perfil | /precio | /alerta-precio | /mis-alertas | /quitar-alerta | /buscar-grupo | /ayuda | /test (admin)\n");
 });
 
 client.on("guildCreate", (guild) => {
