@@ -38,7 +38,11 @@ import {
 import { getSielCharacterProfile } from "./siel.js";
 import { renderProfileCard } from "./profile-card.js";
 import { getGuildRanking } from "./guild-ranking.js";
-import { renderGuildRankingCard } from "./guild-ranking-card.js";
+import {
+  renderGuildRankingCard,
+  renderGuildTop3Card,
+  renderGuildTop10Card,
+} from "./guild-ranking-card.js";
 import { getMarketItem, searchMarketItems } from "./market.js";
 import {
   createPriceAlert,
@@ -921,6 +925,22 @@ function buildGuildRankingEmbed(ranking) {
   return embed;
 }
 
+function buildGuildHighlightEmbed(ranking, kind) {
+  const updatedAt = Math.floor(ranking.fetchedAt / 1000);
+  const isTop3 = kind === "top3";
+  return new EmbedBuilder()
+    .setColor(0xc92d3a)
+    .setTitle(isTop3 ? "🏆 Top 3 de ZENTH" : "🏆 Top 10 de ZENTH")
+    .setURL(ranking.url)
+    .setDescription(isTop3
+      ? "Los tres personajes con mayor poder de combate de la guild."
+      : "Los diez personajes con mayor poder de combate de la guild.")
+    .setImage(`attachment://${isTop3 ? "zenth-top-3.jpg" : "zenth-top-10.jpg"}`)
+    .setFooter({ text: "ZENTH AION 2 BOT · Fuente: Siel · Se actualiza cada cinco minutos" })
+    .setTimestamp(new Date(ranking.fetchedAt))
+    .setAuthor({ name: `NA East / Zikel · Actualizado <t:${updatedAt}:R>` });
+}
+
 function buildGuildRankingControls() {
   const openRanking = new ButtonBuilder()
     .setLabel("Abrir ranking en Siel")
@@ -930,28 +950,48 @@ function buildGuildRankingControls() {
   return new ActionRowBuilder().addComponents(openRanking);
 }
 
-async function saveGuildRankingMessageId(messageId) {
+async function saveGuildRankingMessageIds(messages) {
   await mkdir(path.dirname(GUILD_RANKING_STATE_PATH), { recursive: true });
   const temporaryPath = `${GUILD_RANKING_STATE_PATH}.tmp`;
-  await writeFile(temporaryPath, JSON.stringify({ channelId: GUILD_RANKING_CHANNEL_ID, messageId }), "utf8");
+  await writeFile(temporaryPath, JSON.stringify({ channelId: GUILD_RANKING_CHANNEL_ID, messages }), "utf8");
   await rename(temporaryPath, GUILD_RANKING_STATE_PATH);
 }
 
-async function findGuildRankingMessage(channel) {
+async function findGuildRankingMessages(channel) {
+  const titles = {
+    top3: "🏆 Top 3 de ZENTH",
+    top10: "🏆 Top 10 de ZENTH",
+    general: "🏆 Ranking de ZENTH",
+  };
+  const found = { top3: null, top10: null, general: null };
+  let saved = {};
   try {
-    const saved = JSON.parse(await readFile(GUILD_RANKING_STATE_PATH, "utf8"));
-    if (saved.channelId === channel.id && saved.messageId) {
-      const message = await channel.messages.fetch(saved.messageId).catch(() => null);
-      if (message?.author.id === client.user.id) return message;
-    }
+    saved = JSON.parse(await readFile(GUILD_RANKING_STATE_PATH, "utf8"));
   } catch {
-    // Si el estado local falta o el mensaje se borró, se busca en mensajes recientes.
+    // Si falta el estado local, localiza las tarjetas por sus títulos.
   }
 
-  const recentMessages = await channel.messages.fetch({ limit: 100 });
-  return recentMessages.find((message) =>
-    message.author.id === client.user.id &&
-    message.embeds.some((embed) => embed.title === "🏆 Ranking de ZENTH")) || null;
+  if (saved.channelId === channel.id) {
+    const ids = saved.messages || { general: saved.messageId };
+    for (const key of Object.keys(found)) {
+      if (!ids[key]) continue;
+      const message = await channel.messages.fetch(ids[key]).catch(() => null);
+      if (message?.author.id === client.user.id && message.embeds.some((embed) => embed.title === titles[key])) {
+        found[key] = message;
+      }
+    }
+  }
+
+  if (Object.values(found).some((message) => !message)) {
+    const recentMessages = await channel.messages.fetch({ limit: 100 });
+    for (const [key, title] of Object.entries(titles)) {
+      if (found[key]) continue;
+      found[key] = recentMessages.find((message) =>
+        message.author.id === client.user.id &&
+        message.embeds.some((embed) => embed.title === title)) || null;
+    }
+  }
+  return found;
 }
 
 async function updateGuildRanking() {
@@ -959,26 +999,59 @@ async function updateGuildRanking() {
   updatingGuildRanking = true;
   try {
     const ranking = await getGuildRanking();
-    const image = await renderGuildRankingCard(ranking);
     const channel = await client.channels.fetch(GUILD_RANKING_CHANNEL_ID);
     if (!channel?.isTextBased() || !channel.messages || !channel.send) {
       throw new Error(`El canal ${GUILD_RANKING_CHANNEL_ID} no es un canal de texto disponible.`);
     }
 
-    const attachment = new AttachmentBuilder(image, { name: "zenth-ranking.jpg" });
-    const payload = {
-      embeds: [buildGuildRankingEmbed(ranking)],
-      components: [buildGuildRankingControls()],
-      files: [attachment],
-    };
-    let message = await findGuildRankingMessage(channel);
-    if (message) {
-      message = await message.edit({ ...payload, attachments: [] });
+    const rankingImage = await renderGuildRankingCard(ranking);
+    const top3Image = await renderGuildTop3Card(ranking);
+    const top10Image = await renderGuildTop10Card(ranking);
+    const found = await findGuildRankingMessages(channel);
+    const orderedKeys = ["top3", "top10", "general"];
+    let messages;
+
+    if (orderedKeys.some((key) => !found[key])) {
+      // Publica las tres tarjetas juntas para conservar siempre el orden solicitado.
+      for (const existing of Object.values(found)) {
+        if (existing) await existing.delete().catch(() => {});
+      }
+      const payloads = [
+        {
+          embeds: [buildGuildHighlightEmbed(ranking, "top3")],
+          files: [new AttachmentBuilder(top3Image, { name: "zenth-top-3.jpg" })],
+        },
+        {
+          embeds: [buildGuildHighlightEmbed(ranking, "top10")],
+          files: [new AttachmentBuilder(top10Image, { name: "zenth-top-10.jpg" })],
+        },
+        {
+          embeds: [buildGuildRankingEmbed(ranking)],
+          components: [buildGuildRankingControls()],
+          files: [new AttachmentBuilder(rankingImage, { name: "zenth-ranking.jpg" })],
+        },
+      ];
+      messages = {};
+      for (let index = 0; index < orderedKeys.length; index += 1) {
+        messages[orderedKeys[index]] = await channel.send(payloads[index]);
+      }
     } else {
-      message = await channel.send(payload);
+      const images = { top3: top3Image, top10: top10Image, general: rankingImage };
+      messages = {};
+      for (const key of orderedKeys) {
+        const isGeneral = key === "general";
+        const fileName = isGeneral ? "zenth-ranking.jpg" : `zenth-${key === "top3" ? "top-3" : "top-10"}.jpg`;
+        const payload = {
+          embeds: [isGeneral ? buildGuildRankingEmbed(ranking) : buildGuildHighlightEmbed(ranking, key)],
+          files: [new AttachmentBuilder(images[key], { name: fileName })],
+          ...(isGeneral ? { components: [buildGuildRankingControls()] } : {}),
+        };
+        messages[key] = await found[key].edit({ ...payload, attachments: [] });
+      }
     }
-    await saveGuildRankingMessageId(message.id);
-    console.log(`✅ Ranking de ZENTH actualizado en el canal ${GUILD_RANKING_CHANNEL_ID} (${ranking.members.length} miembros).`);
+
+    await saveGuildRankingMessageIds(Object.fromEntries(Object.entries(messages).map(([key, message]) => [key, message.id])));
+    console.log(`✅ Rankings Top 3, Top 10 y general actualizados en el canal ${GUILD_RANKING_CHANNEL_ID} (${ranking.members.length} miembros).`);
   } catch (error) {
     console.error(`❌ No se pudo actualizar el ranking de ZENTH: ${error.message}`);
   } finally {
