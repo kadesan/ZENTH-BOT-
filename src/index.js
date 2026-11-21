@@ -101,6 +101,11 @@ const APPLICATION_REJECT_BUTTON_ID = "guild-application:reject";
 const APPLICATION_REJECT_MODAL_PREFIX = "guild-application:reject-reason:";
 const PVE_CATEGORY_ID = "1135023136904052797";
 const PVE_VOICE_ROLE_IDS = ["1556537224340832316", "1549946232200232971"];
+const PUBLIC_VOICE_CATEGORY_NAME = "═══════  ⋆ Bienvenida ⋆  ══════";
+const PUBLIC_VOICE_GENERATOR_NAME = "➕︱Generador";
+const PUBLIC_VOICE_ROOM_PREFIX = "Sala · ";
+const publicVoiceGeneratorIds = new Map();
+const publicVoiceCategoryIds = new Map();
 const PRICE_COMMANDS = new Set(["precio", "alerta-precio", "mis-alertas", "quitar-alerta"]);
 const GROUP_ROLES = [
   { value: "tank", name: "Tank", emoji: "🛡️" },
@@ -1742,6 +1747,122 @@ async function closePveGroup(group, reason) {
   await removePveGroup(group.id);
 }
 
+async function ensurePublicVoiceGenerator(guild) {
+  try {
+    const channels = await guild.channels.fetch();
+    const category = channels.find((channel) =>
+      channel?.type === ChannelType.GuildCategory && channel.name === PUBLIC_VOICE_CATEGORY_NAME);
+    if (!category) {
+      console.error(`❌ No se encontró la categoría de voz pública “${PUBLIC_VOICE_CATEGORY_NAME}” en ${guild.name}.`);
+      return;
+    }
+
+    const generator = channels.find((channel) =>
+      channel?.type === ChannelType.GuildVoice &&
+      channel.parentId === category.id &&
+      channel.name === PUBLIC_VOICE_GENERATOR_NAME);
+    const everyone = guild.roles.everyone;
+    const botMember = guild.members.me ?? await guild.members.fetch(client.user.id);
+    let generatorChannel = generator;
+
+    if (!generatorChannel) {
+      const lastPosition = category.children.cache.reduce(
+        (last, channel) => Math.max(last, channel.position),
+        category.position,
+      );
+      generatorChannel = await guild.channels.create({
+        name: PUBLIC_VOICE_GENERATOR_NAME,
+        type: ChannelType.GuildVoice,
+        parent: category.id,
+        position: lastPosition + 1,
+        permissionOverwrites: [
+          { id: everyone.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect] },
+          { id: botMember.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect, PermissionFlagsBits.ManageChannels, PermissionFlagsBits.MoveMembers] },
+        ],
+        reason: "Generador público de canales de voz temporales de ZENTH",
+      });
+      console.log(`✅ Canal generador de voz creado en la categoría ${PUBLIC_VOICE_CATEGORY_NAME}.`);
+    } else {
+      await generatorChannel.permissionOverwrites.edit(everyone, {
+        ViewChannel: true,
+        Connect: true,
+      });
+      await generatorChannel.permissionOverwrites.edit(botMember, {
+        ViewChannel: true,
+        Connect: true,
+        ManageChannels: true,
+        MoveMembers: true,
+      });
+    }
+
+    publicVoiceGeneratorIds.set(guild.id, generatorChannel.id);
+    publicVoiceCategoryIds.set(guild.id, category.id);
+
+    for (const channel of category.children.cache.values()) {
+      if (channel.id !== generatorChannel.id &&
+          channel.type === ChannelType.GuildVoice &&
+          channel.name.startsWith(PUBLIC_VOICE_ROOM_PREFIX) &&
+          channel.members.size === 0) {
+        await channel.delete("Limpieza de sala pública temporal vacía al iniciar el bot").catch(() => {});
+      }
+    }
+  } catch (error) {
+    console.error(`❌ No se pudo preparar el generador de voz en ${guild.name}: ${error.message}`);
+  }
+}
+
+async function createPublicVoiceRoom(newState) {
+  const guild = newState.guild;
+  const generatorId = publicVoiceGeneratorIds.get(guild.id);
+  if (!generatorId || newState.channelId !== generatorId || newState.member?.user.bot) return;
+
+  let room;
+  try {
+    const member = newState.member;
+    const categoryId = publicVoiceCategoryIds.get(guild.id);
+    if (!categoryId || member.voice.channelId !== generatorId) return;
+    const cleanName = String(member.displayName || member.user.username)
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .replace(/[^\p{L}\p{N} _-]/gu, "")
+      .trim()
+      .slice(0, 75) || "Daeva";
+    const botMember = guild.members.me ?? await guild.members.fetch(client.user.id);
+    room = await guild.channels.create({
+      name: `${PUBLIC_VOICE_ROOM_PREFIX}${cleanName}`.slice(0, 100),
+      type: ChannelType.GuildVoice,
+      parent: categoryId,
+      permissionOverwrites: [
+        { id: guild.roles.everyone.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect] },
+        { id: botMember.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect, PermissionFlagsBits.ManageChannels, PermissionFlagsBits.MoveMembers] },
+        { id: member.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect, PermissionFlagsBits.ManageChannels] },
+      ],
+      reason: `Sala de voz pública temporal para ${member.user.tag}`,
+    });
+
+    if (member.voice.channelId !== generatorId) {
+      if (room.members.size === 0) await room.delete("El usuario salió del generador antes de entrar a su sala").catch(() => {});
+      return;
+    }
+    await member.voice.setChannel(room, "Sala pública temporal creada desde el generador de ZENTH");
+  } catch (error) {
+    if (room && room.members.size === 0) await room.delete("No se pudo completar la creación de la sala pública").catch(() => {});
+    console.error(`❌ No se pudo crear la sala pública temporal: ${error.message}`);
+  }
+}
+
+async function deleteEmptyPublicVoiceRoom(oldState) {
+  const channel = oldState.channel;
+  const categoryId = publicVoiceCategoryIds.get(oldState.guild.id);
+  if (!channel || !categoryId || channel.parentId !== categoryId ||
+      channel.name === PUBLIC_VOICE_GENERATOR_NAME ||
+      !channel.name.startsWith(PUBLIC_VOICE_ROOM_PREFIX) ||
+      channel.members.size > 0) return;
+  await channel.delete("La sala pública temporal quedó vacía").catch((error) => {
+    console.error(`❌ No se pudo borrar la sala de voz vacía ${channel.name}: ${error.message}`);
+  });
+}
+
 let checkingPveGroups = false;
 let pveGroupCleanupTimer;
 
@@ -2526,6 +2647,7 @@ client.once("clientReady", async (bot) => {
   void checkPveGroupsForCleanup();
   void refreshAllPveGroupMessages();
   for (const guild of bot.guilds.cache.values()) {
+    void ensurePublicVoiceGenerator(guild);
     void registerGuildCommands(guild);
     void ensureGuildApplicationPanel(guild);
     void refreshGuildApplicationTickets(guild);
@@ -2536,9 +2658,19 @@ client.once("clientReady", async (bot) => {
 });
 
 client.on("guildCreate", (guild) => {
+  void ensurePublicVoiceGenerator(guild);
   void registerGuildCommands(guild);
   void ensureGuildApplicationPanel(guild);
   void refreshGuildApplicationTickets(guild);
+});
+
+client.on("voiceStateUpdate", (oldState, newState) => {
+  if (newState.channelId && oldState.channelId !== newState.channelId) {
+    void createPublicVoiceRoom(newState);
+  }
+  if (oldState.channelId && oldState.channelId !== newState.channelId) {
+    void deleteEmptyPublicVoiceRoom(oldState);
+  }
 });
 
 // ─── Evento: Mensajes ──────────────────────────────────────────────────────────
