@@ -192,6 +192,12 @@ async function renderHighlightCard(ranking, members, kind) {
   const subtitle = kind === "top3"
     ? "LOS MAYORES PODERES DE COMBATE DE LA GUILD"
     : "PUESTOS 1–10 · ORDENADOS POR PODER DE COMBATE";
+  const updateTime = new Intl.DateTimeFormat("es-CO", {
+    timeZone: "America/Bogota",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: true,
+  }).format(new Date(ranking.fetchedAt));
   const defs = [];
   let content = "";
 
@@ -260,7 +266,7 @@ async function renderHighlightCard(ranking, members, kind) {
     <text x="135" y="112" fill="#b5bbc8" font-family="Arial, sans-serif" font-size="16" font-weight="600" letter-spacing="1">AION 2 · NA EAST / ZIKEL · ${subtitle}</text>
     <text x="1445" y="78" text-anchor="end" fill="#ffb8bb" font-family="Arial, sans-serif" font-size="16" font-weight="700">${escapeXml(ranking.faction || "ZENTH")}</text>
     ${content}
-    <text x="50" y="${height - 38}" fill="#9299a6" font-family="Arial, sans-serif" font-size="14">SIEL · ACTUALIZADO CADA 5 MINUTOS</text>
+    <text x="50" y="${height - 38}" fill="#9299a6" font-family="Arial, sans-serif" font-size="14">SIEL · DATOS ACTUALIZADOS ${escapeXml(updateTime)} · HORA COLOMBIA</text>
     <text x="1448" y="${height - 38}" text-anchor="end" fill="#ffb8bb" font-family="Arial, sans-serif" font-size="14" font-weight="700" letter-spacing="2">ZENTH</text>
   </svg>`;
   return sharp(Buffer.from(svg)).jpeg({ quality: 90, mozjpeg: true }).toBuffer();

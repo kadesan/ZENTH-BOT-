@@ -933,12 +933,12 @@ function buildGuildHighlightEmbed(ranking, kind) {
     .setTitle(isTop3 ? "🏆 Top 3 de ZENTH" : "🏆 Top 10 de ZENTH")
     .setURL(ranking.url)
     .setDescription(isTop3
-      ? "Los tres personajes con mayor poder de combate de la guild."
-      : "Los diez personajes con mayor poder de combate de la guild.")
+      ? `Los tres personajes con mayor poder de combate de la guild.\nDatos consultados <t:${updatedAt}:R>.`
+      : `Los diez personajes con mayor poder de combate de la guild.\nDatos consultados <t:${updatedAt}:R>.`)
     .setImage(`attachment://${isTop3 ? "zenth-top-3.jpg" : "zenth-top-10.jpg"}`)
-    .setFooter({ text: "ZENTH AION 2 BOT · Fuente: Siel · Se actualiza cada cinco minutos" })
+    .setFooter({ text: "ZENTH AION 2 BOT · Fuente: Siel · Actualizado" })
     .setTimestamp(new Date(ranking.fetchedAt))
-    .setAuthor({ name: `NA East / Zikel · Actualizado <t:${updatedAt}:R>` });
+    .setAuthor({ name: "NA East / Zikel" });
 }
 
 function buildGuildRankingControls() {
